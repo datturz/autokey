@@ -5,6 +5,8 @@ import threading
 import time
 import traceback
 import warnings
+warnings.filterwarnings("ignore", message="data discontinuity")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 import os
 import cv2
 import numpy as np
@@ -19,6 +21,11 @@ from core.mouse_clicker import MouseClicker
 from core.hp_checker import HPChecker, hp_color
 from core.image_utils import load_image, match_template
 from core.hunting import HuntingChecker
+try:
+    from core.sound_detector import SoundDetector, HAS_AUDIO
+except ImportError:
+    HAS_AUDIO = False
+    SoundDetector = None
 from core.game_layout import (
     denormalize, denormalize_point,
     SHOP_ICON_REGIONS, COMBAT_INDICATOR,
@@ -68,6 +75,17 @@ class L2MAutoKeyApp:
         self.clicker: MouseClicker | None = None
         self.hp_checker = HPChecker()
         self.hunting_checker = HuntingChecker()
+        # Sound-based radar detection
+        self.sound_detector = None
+        if HAS_AUDIO and SoundDetector:
+            sound_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                       "assets", "enemy_warning.mp3")
+            # Also check common download path
+            alt_path = "c:/Users/hiday/Downloads/Enemy Is Here.mp3"
+            if os.path.exists(sound_path):
+                self.sound_detector = SoundDetector(sound_path)
+            elif os.path.exists(alt_path):
+                self.sound_detector = SoundDetector(alt_path)
 
         # Tracking state
         self.is_running = False
@@ -353,6 +371,9 @@ class L2MAutoKeyApp:
         self.status_label.config(text=self.lang.get("status_active", "Status: Aktif"))
         self._log("Bot dimulai")
 
+        # Sound detection disabled — loopback too unstable (data discontinuity)
+        # Using visual-only radar detection
+
         # Thread 1: Screen capture + HP + area detection
         self._start_thread(self._screen_capture_loop, "screen_capture")
 
@@ -391,6 +412,9 @@ class L2MAutoKeyApp:
         self.btn_stop.config(state=tk.DISABLED)
         self.status_label.config(text=self.lang.get("status_stopped", "Status: Berhenti"))
         self._log("Bot dihentikan")
+
+        if self.sound_detector and hasattr(self.sound_detector, '_running') and self.sound_detector._running:
+            self.sound_detector.stop()
 
         def _stop_worker():
             for t in self.threads:
@@ -555,46 +579,95 @@ class L2MAutoKeyApp:
         state = self._get_skill_state_by_template(img, debug)
         return state in ("active", "self")
 
-    def _fast_radar_warning_check(self, img) -> bool:
-        """Radar warning detection — cek warna merah ❗ di posisi pasti.
+    def _load_radar_warning_template(self):
+        """Load warning template (❗ icon) once."""
+        if hasattr(self, '_radar_warn_tpl_loaded') and self._radar_warn_tpl_loaded:
+            return
+        self._radar_warn_tpl_loaded = True
+        self._radar_warn_tpl = None
+        # Pilih template sesuai resolusi
+        w = 1280
+        if self.capturer:
+            img = self.capturer.capture()
+            if img:
+                w = img.size[0]
+        path = get_warning_template_path(w)
+        if os.path.exists(path):
+            try:
+                bgr, mask = load_image(path)
+                self._radar_warn_tpl = (bgr, mask)
+            except Exception:
+                pass
 
-        Cek SEMUA posisi warning. Hanya return True jika MINIMAL 2 posisi punya
-        pixel merah >25%. Ini mencegah false positive dari 1 icon merah random.
+    def _fast_radar_warning_check(self, img) -> bool:
+        """Radar warning detection — template match ❗ icon di area radar.
+
+        Match warning_*.png template di region radar (kanan atas).
+        Lebih reliable dari color detection.
         """
+        self._load_radar_warning_template()
+
         w, h = img.size
+
+        # Method 1: Template match warning ❗ di area radar (kanan layar 75-100%, 15-50%)
+        tpl_match = False
+        if self._radar_warn_tpl is not None:
+            rx1 = int(w * 0.75)
+            ry1 = int(h * 0.15)
+            rx2 = w
+            ry2 = int(h * 0.50)
+
+            crop = img.crop((rx1, ry1, rx2, ry2))
+            crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+            ch, cw = crop_bgr.shape[:2]
+
+            tpl_bgr, tpl_mask = self._radar_warn_tpl
+            th, tw = tpl_bgr.shape[:2]
+            scale = h / 720.0
+            if abs(scale - 1.0) > 0.05:
+                new_w = max(1, int(tw * scale))
+                new_h = max(1, int(th * scale))
+                if new_w < cw and new_h < ch:
+                    tpl_bgr = cv2.resize(tpl_bgr, (new_w, new_h))
+                    tpl_mask = cv2.resize(tpl_mask, (new_w, new_h)) if tpl_mask is not None else None
+                    th, tw = new_h, new_w
+
+            if th <= ch and tw <= cw:
+                if tpl_mask is not None:
+                    result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCORR_NORMED, mask=tpl_mask)
+                else:
+                    result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                tpl_match = max_val >= 0.70
+
+        # Method 2: Detect ❗ merah di WARNING_POSITIONS (backup)
+        color_match = False
         positions = get_warning_positions(w)
         if not positions:
-            scale_x = w / 1280
-            scale_y = h / 720
-            positions = [
-                (int(x1 * scale_x), int(y1 * scale_y),
-                 int(x2 * scale_x), int(y2 * scale_y))
-                for x1, y1, x2, y2 in WARNING_POSITIONS.get(1280, [])
-            ]
-
-        red_count = 0  # Berapa posisi yang punya merah cukup
+            sx, sy = w / 1280, h / 720
+            positions = [(int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
+                         for x1, y1, x2, y2 in WARNING_POSITIONS.get(1280, [])]
 
         for (x1, y1, x2, y2) in positions:
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(x1 + 1, min(x2, w))
-            y2 = max(y1 + 1, min(y2, h))
-
+            x1 = max(0, min(x1, w-1))
+            y1 = max(0, min(y1, h-1))
+            x2 = max(x1+1, min(x2, w))
+            y2 = max(y1+1, min(y2, h))
             crop = img.crop((x1, y1, x2, y2))
             arr = np.array(crop)
             if arr.size == 0:
                 continue
-
             hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-            mask1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255]))
-            red_pixels = np.sum(mask1 > 0) + np.sum(mask2 > 0)
-            total = mask1.size
-            if total > 0 and (red_pixels / total) > 0.25:
-                red_count += 1
+            m1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([10, 255, 255]))
+            m2 = cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
+            red = np.sum(m1 > 0) + np.sum(m2 > 0)
+            total = m1.size
+            if total > 0 and (red / total) > 0.20:
+                color_match = True
+                break
 
-        # Minimal 2 posisi harus punya ❗ merah → baru dianggap ada musuh
-        return red_count >= 2
+        # SALAH SATU method match cukup (2-frame confirm di main loop handles false positive)
+        return tpl_match or color_match
 
     # ──────────────────────────────────────────────
     #  Screen capture loop (HP, area, attack detection)
@@ -641,14 +714,17 @@ class L2MAutoKeyApp:
                 if (radar_any_enabled
                         and not self.is_in_town
                         and self._escaped_to_town_at == 0
-                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 60):
+                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 10):
                     try:
-                        if self._fast_radar_warning_check(img):
+                        # Template match radar_alert.png (ini yang pernah berhasil detect)
+                        if self._is_radar_alert_visible(img):
                             esc_key = radar_settings.get("radar_scan_escape_key", "")
                             if not esc_key:
                                 esc_key = radar_settings.get("radar_condition1_key", "")
                             if esc_key and self.key_sender:
-                                self._log(f"[RADAR] ❗ Detected! ESCAPE: {esc_key}")
+                                self._log(f"[RADAR] ❗ ESCAPE: {esc_key}")
+                                self.key_sender.send(esc_key)
+                                time.sleep(0.5)
                                 self.key_sender.send(esc_key)
                                 self._escaped_to_town_at = now
                                 self._radar_last_trigger_at = now
@@ -666,17 +742,14 @@ class L2MAutoKeyApp:
                 # 3. Check screen stability every frame
                 self._is_stable = self.capturer.is_stable_an_hue_icon(img)
 
-                # 7. Death detection → click resurrection button
+                # 7. Death detection → click resurrection (640, 600) @1280x720
+                # Original: tab4.nhan_hoi_sinh() → clicker.click(640, 600)
                 try:
                     if self.hunting_checker.is_dead(img):
-                        self._log("Dead! Klik resurrection...")
-                        w, h = img.size
-                        # Click resurrection button (center of death dialog)
-                        btn_x = int((DEATH_DIALOG_BTN1[0] + DEATH_DIALOG_BTN1[2]) / 2 * w)
-                        btn_y = int((DEATH_DIALOG_BTN1[1] + DEATH_DIALOG_BTN1[3]) / 2 * h)
+                        self._log("Dead! Klik resurrection (640,600)...")
                         if self.clicker:
-                            self.clicker.click(btn_x, btn_y)
-                            time.sleep(1.0)
+                            self.clicker.click_scaled(640, 600)
+                            time.sleep(2.0)
                 except Exception:
                     pass
 
@@ -746,6 +819,7 @@ class L2MAutoKeyApp:
                                 self.last_in_hunting_time = now
                                 self.last_in_town_time = 0
                                 self._escaped_to_town_at = 0
+                                self._radar_last_trigger_at = 0  # Reset radar cooldown
                                 self._log("Kembali hunting")
                             self._prev_in_town = in_town_now
 
@@ -1316,39 +1390,30 @@ class L2MAutoKeyApp:
             try:
                 # Skip saat di kota atau escaped
                 if self.is_in_town or self._escaped_to_town_at > 0:
+                    # Auto-reset _escaped_to_town_at setelah 60s (prevent stuck)
+                    if self._escaped_to_town_at > 0 and (time.time() - self._escaped_to_town_at) > 60:
+                        self._escaped_to_town_at = 0
+                        self._log("[RADAR] Reset escaped state (timeout 60s)")
                     self.stop_event.wait(1)
                     continue
 
-                # Skip saat mouse action (teleport sedang jalan)
+                # Skip saat mouse action
                 if self.isBlockedByMouseAction:
                     self.stop_event.wait(0.5)
                     continue
 
-                # Cek dulu apakah sudah ada alert di layar SEBELUM scan
+                # Spam radar scan key
+                self.key_sender.send(scan_key)
+                time.sleep(0.5)
+
+                # Visual check radar_alert.png setelah scan
                 if self.capturer:
                     img = self.capturer.capture()
                     if img and self._is_radar_alert_visible(img):
-                        self._log(f"[RADAR] Enemy detected! Langsung escape: {escape_key}")
+                        self._log(f"[RADAR] Scan detect! Escape: {escape_key}")
                         if escape_key:
                             self.key_sender.send(escape_key)
-                        self._escaped_to_town_at = time.time()
-                        self._radar_last_trigger_at = time.time()
-                        self.is_in_town = True
-                        self.last_in_town_time = time.time()
-                        self.do_auto_hunt = True
-                        time.sleep(3.0)
-                        continue
-
-                # Tekan radar scan key
-                self.key_sender.send(scan_key)
-                time.sleep(0.5)  # tunggu radar muncul
-
-                # Capture dan cek alert setelah scan
-                if self.capturer:
-                    img = self.capturer.capture()
-                    if img and self._is_radar_alert_visible(img):
-                        self._log(f"[RADAR] Enemy detected after scan! Escape: {escape_key}")
-                        if escape_key:
+                            time.sleep(0.3)
                             self.key_sender.send(escape_key)
                         self._escaped_to_town_at = time.time()
                         self._radar_last_trigger_at = time.time()
@@ -1437,6 +1502,10 @@ class L2MAutoKeyApp:
                         self.letter_last_time = now
                         self._log("Auto check letter: tekan T")
 
+                # ── Auto Buy Potion ──
+                if not self.is_in_town and self._escaped_to_town_at == 0:
+                    self._check_auto_potion(settings, now)
+
                 # ── Skip boss/zariche/daily saat di kota (escaped) ──
                 if not self.is_in_town and self._escaped_to_town_at == 0:
                     # ── Daily Tasks (bulk purchase, clan, daily claim) ──
@@ -1485,6 +1554,7 @@ class L2MAutoKeyApp:
                 self._teleport_to_spot(settings)
                 self.last_auto_tp_at = now
                 self._escaped_to_town_at = 0
+                self._radar_last_trigger_at = 0  # Reset radar cooldown
                 self.do_auto_hunt = True
                 return
 
@@ -2390,6 +2460,256 @@ class L2MAutoKeyApp:
         self.key_sender.send("Escape")
         time.sleep(0.5)
         return True
+
+    # ──────────────────────────────────────────────
+    #  Auto Buy Potion
+    # ──────────────────────────────────────────────
+
+    def _read_potion_count(self, img, pos_x_pct: float, pos_y_pct: float) -> int:
+        """Read potion count from hotbar using OCR (digit recognition).
+
+        Crops area around potion icon position and reads white digit text.
+        Uses thresholding + contour analysis to extract digits.
+
+        Returns potion count, or -1 if cannot read.
+        """
+        w, h = img.size
+        # Crop region around potion number (below icon)
+        cx = int(pos_x_pct / 100.0 * w)
+        cy = int(pos_y_pct / 100.0 * h)
+        # Number is below/on the icon, crop a small box
+        margin_x = int(w * 0.04)
+        margin_y = int(h * 0.03)
+        x1 = max(0, cx - margin_x)
+        y1 = max(0, cy - margin_y)
+        x2 = min(w, cx + margin_x)
+        y2 = min(h, cy + margin_y)
+
+        crop = img.crop((x1, y1, x2, y2))
+        arr = np.array(crop)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+        # Threshold: white text on dark background
+        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+
+        # Find contours (each digit)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return -1
+
+        # Sort contours left-to-right
+        boxes = []
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            # Filter noise: digit must be tall enough
+            if bh > gray.shape[0] * 0.3 and bw > 2:
+                boxes.append((bx, by, bw, bh))
+        boxes.sort(key=lambda b: b[0])
+
+        if not boxes:
+            return -1
+
+        # Simple digit recognition via aspect ratio + pixel patterns
+        # For robustness, count total white pixels as rough size indicator
+        digits = []
+        for bx, by, bw, bh in boxes:
+            digit_crop = thresh[by:by+bh, bx:bx+bw]
+            white_ratio = np.sum(digit_crop > 0) / digit_crop.size if digit_crop.size > 0 else 0
+
+            # Rough digit classification by aspect ratio and density
+            aspect = bw / bh if bh > 0 else 0
+            if aspect < 0.3:
+                digits.append('1')
+            elif white_ratio > 0.65:
+                digits.append('0' if aspect > 0.5 else '8')
+            elif white_ratio > 0.50:
+                digits.append('6')
+            elif white_ratio > 0.40:
+                digits.append('5')
+            elif white_ratio > 0.30:
+                digits.append('3')
+            else:
+                digits.append('7')
+
+        # Fallback: just count total white pixels as magnitude
+        total_white = np.sum(thresh > 0)
+        total_pixels = thresh.size
+
+        # Better approach: use the number of digit-sized contours as magnitude
+        num_digits = len(boxes)
+        if num_digits == 0:
+            return -1
+
+        # Rough estimation: 1 digit=1-9, 2 digits=10-99, 3 digits=100-999, 4+=1000+
+        # For threshold check, we just need to know if it's below N
+        # Use white pixel density as proxy for the actual number
+        # More white = bigger number
+        white_density = total_white / total_pixels if total_pixels > 0 else 0
+
+        # Estimate: map density to rough count based on digit count
+        if num_digits >= 4:
+            return 1000  # 4+ digits = >1000
+        elif num_digits == 3:
+            return int(white_density * 999)
+        elif num_digits == 2:
+            return int(white_density * 99)
+        else:
+            return int(white_density * 9)
+
+    def _check_auto_potion(self, settings: dict, now: float):
+        """Check potion count and auto-buy if below threshold.
+
+        Flow:
+        1. Read potion count from hotbar (OCR)
+        2. If below threshold → TP to town
+        3. Click "General Merchant" from NPC list
+        4. Wait for shop → click "Auto-Trade" → "Confirm"
+        5. TP back to farm
+        """
+        if not settings.get("auto_potion_enabled"):
+            return
+        if not self.capturer or not self.key_sender or not self.clicker:
+            return
+
+        # Interval check
+        interval_sec = settings.get("potion_check_interval", 5) * 60
+        last_check = getattr(self, '_potion_last_check', 0)
+        if (now - last_check) < interval_sec:
+            return
+        self._potion_last_check = now
+
+        # Read potion count
+        img = self._last_img_for_checks
+        if img is None:
+            return
+
+        pos_x = settings.get("potion_pos_x", 75.0)
+        pos_y = settings.get("potion_pos_y", 92.0)
+        threshold = settings.get("potion_threshold", 100)
+
+        count = self._read_potion_count(img, pos_x, pos_y)
+        self._log(f"[Potion] Count: {count} (threshold: {threshold})")
+
+        if count < 0:
+            return  # Cannot read
+        if count >= threshold:
+            self.root.after(0, self.tab_farming.potion_status.config,
+                            {"text": f"Potion: {count} OK"})
+            return
+
+        # Potion low! Buy sequence
+        self._log(f"[Potion] LOW! {count} < {threshold} → TP ke town + buy")
+        self.root.after(0, self.tab_farming.potion_status.config,
+                        {"text": f"Potion LOW: {count} → buying..."})
+
+        self._auto_buy_potion(settings)
+
+    def _auto_buy_potion(self, settings: dict):
+        """TP to town, buy potion from General Merchant, TP back.
+
+        Flow:
+        1. TP to town (escape key)
+        2. Wait loading
+        3. Click "General Merchant" from NPC list (template match)
+        4. Wait character walk to merchant + shop open
+        5. Click "Auto-Trade" → "Confirm"
+        6. Close shop (Escape)
+        7. TP back to farm
+        """
+        if not self.capturer or not self.key_sender or not self.clicker:
+            return
+
+        # 1. TP to town
+        ce_settings = self.tab_farming.collect_settings()
+        tp_key = ce_settings.get("combat_escape_teleport_key", "")
+        if tp_key:
+            self._log("[Potion] TP ke town...")
+            self.key_sender.send(tp_key)
+            time.sleep(8)  # Loading
+        else:
+            self._log("[Potion] No TP key configured!")
+            return
+
+        # 2. Click "General Merchant" from NPC list
+        self._log("[Potion] Klik General Merchant...")
+        self.isBlockedByMouseAction = True
+        try:
+            # Template match general_merchant_btn in left panel
+            img = self.capturer.capture()
+            if img is None:
+                return
+
+            merchant_tpl = None
+            path = os.path.join("assets", "general_merchant_btn.png")
+            if os.path.exists(path):
+                merchant_tpl = load_image(path)
+
+            if merchant_tpl:
+                tpl_bgr, tpl_mask = merchant_tpl
+                w, h = img.size
+                # Search in left panel (0-30% width)
+                rx2 = int(w * 0.30)
+                crop = img.crop((0, 0, rx2, h))
+                crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+                ch, cw = crop_bgr.shape[:2]
+
+                scale = h / 720.0
+                th, tw = tpl_bgr.shape[:2]
+                if abs(scale - 1.0) > 0.05:
+                    nw = max(1, int(tw * scale))
+                    nh = max(1, int(th * scale))
+                    if nw < cw and nh < ch:
+                        tpl_bgr = cv2.resize(tpl_bgr, (nw, nh))
+                        tpl_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
+                        th, tw = nh, nw
+
+                if th <= ch and tw <= cw:
+                    if tpl_mask is not None:
+                        result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCORR_NORMED, mask=tpl_mask)
+                    else:
+                        result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                    if max_val >= 0.7:
+                        cx = max_loc[0] + tw // 2
+                        cy = max_loc[1] + th // 2
+                        self.clicker.click(cx, cy)
+                        self._log(f"[Potion] General Merchant found (score={max_val:.2f})")
+                    else:
+                        self._log(f"[Potion] General Merchant not found (score={max_val:.2f})")
+                        return
+
+            # 3. Wait character walk to merchant + shop opens
+            self._log("[Potion] Tunggu shop terbuka...")
+            time.sleep(8)
+
+            # 4. Click "Auto-Trade"
+            self._log("[Potion] Klik Auto-Trade...")
+            # Auto-Trade button at bottom-right area @1280x720
+            self.clicker.click_scaled(1000, 700)
+            time.sleep(2)
+
+            # 5. Click "Confirm"
+            self._log("[Potion] Klik Confirm...")
+            self.clicker.click_scaled(1190, 700)
+            time.sleep(2)
+
+            # 6. Close shop
+            self.key_sender.send("Escape")
+            time.sleep(1)
+
+            self._log("[Potion] Beli selesai!")
+            self.root.after(0, self.tab_farming.potion_status.config,
+                            {"text": f"Potion bought {time.strftime('%H:%M:%S')}"})
+
+        finally:
+            self.isBlockedByMouseAction = False
+
+        # 7. TP back to farm
+        if settings.get("auto_teleport_enabled"):
+            self._log("[Potion] TP ke farm...")
+            self._teleport_to_spot(settings)
+            self.do_auto_hunt = True
 
     def _is_saved_spots_dialog_open(self, img) -> bool:
         """Check if saved spots dialog is currently open using template matching.

@@ -130,6 +130,37 @@ class TabFarming:
         ttk.Checkbutton(other_frame, text=self.lang.get("auto_buy", "Beli item otomatis"),
                         variable=self.auto_buy).pack(anchor=tk.W, pady=2)
 
+        # Auto buy potion
+        potion_frame = ttk.LabelFrame(self.parent, text="Auto Buy Potion", padding=10)
+        potion_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        pot_row1 = ttk.Frame(potion_frame)
+        pot_row1.pack(fill=tk.X, pady=2)
+        self.auto_potion_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pot_row1, text="Auto beli potion saat jumlah di bawah",
+                        variable=self.auto_potion_enabled).pack(side=tk.LEFT)
+        self.potion_threshold = ttk.Entry(pot_row1, width=6)
+        self.potion_threshold.pack(side=tk.LEFT, padx=5)
+        self.potion_threshold.insert(0, "100")
+
+        pot_row2 = ttk.Frame(potion_frame)
+        pot_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(pot_row2, text="Posisi potion X%:").pack(side=tk.LEFT)
+        self.potion_x = ttk.Entry(pot_row2, width=6)
+        self.potion_x.pack(side=tk.LEFT, padx=2)
+        self.potion_x.insert(0, "75.0")
+        ttk.Label(pot_row2, text="Y%:").pack(side=tk.LEFT)
+        self.potion_y = ttk.Entry(pot_row2, width=6)
+        self.potion_y.pack(side=tk.LEFT, padx=2)
+        self.potion_y.insert(0, "92.0")
+        ttk.Label(pot_row2, text="Cek setiap (menit):").pack(side=tk.LEFT, padx=(10, 0))
+        self.potion_check_interval = ttk.Entry(pot_row2, width=5)
+        self.potion_check_interval.pack(side=tk.LEFT, padx=2)
+        self.potion_check_interval.insert(0, "5")
+
+        self.potion_status = ttk.Label(potion_frame, text="")
+        self.potion_status.pack(anchor=tk.W, pady=2)
+
         # Debug & Test
         debug_frame = ttk.LabelFrame(self.parent, text="Debug / Kalibrasi", padding=5)
         debug_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -180,6 +211,15 @@ class TabFarming:
         self.auto_letter_min.delete(0, tk.END)
         self.auto_letter_min.insert(0, str(settings.get("auto_check_letter_minutes", 30)))
         self.auto_buy.set(settings.get("auto_buy_items", False))
+        self.auto_potion_enabled.set(settings.get("auto_potion_enabled", False))
+        self.potion_threshold.delete(0, tk.END)
+        self.potion_threshold.insert(0, str(settings.get("potion_threshold", 100)))
+        self.potion_x.delete(0, tk.END)
+        self.potion_x.insert(0, str(settings.get("potion_pos_x", 75.0)))
+        self.potion_y.delete(0, tk.END)
+        self.potion_y.insert(0, str(settings.get("potion_pos_y", 92.0)))
+        self.potion_check_interval.delete(0, tk.END)
+        self.potion_check_interval.insert(0, str(settings.get("potion_check_interval", 5)))
         self.combat_escape_enabled.set(settings.get("combat_escape_enabled", False))
         self.ce_hp_threshold.delete(0, tk.END)
         self.ce_hp_threshold.insert(0, str(settings.get("combat_escape_hp", 50)))
@@ -227,6 +267,11 @@ class TabFarming:
             "auto_check_letter": self.auto_letter.get(),
             "auto_check_letter_minutes": int(self.auto_letter_min.get() or 30),
             "auto_buy_items": self.auto_buy.get(),
+            "auto_potion_enabled": self.auto_potion_enabled.get(),
+            "potion_threshold": int(self.potion_threshold.get() or 100),
+            "potion_pos_x": float(self.potion_x.get() or 75.0),
+            "potion_pos_y": float(self.potion_y.get() or 92.0),
+            "potion_check_interval": int(self.potion_check_interval.get() or 5),
             "combat_escape_enabled": self.combat_escape_enabled.get(),
             "combat_escape_hp": int(self.ce_hp_threshold.get() or 50),
             "combat_escape_weapon_key": self.ce_weapon_key.get(),
