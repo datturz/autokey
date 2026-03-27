@@ -4,12 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
 
     steps:
@@ -23,31 +24,41 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pywin32 opencv-python-headless numpy Pillow mss
+          pip install pyinstaller pywin32 opencv-python-headless numpy Pillow mss supabase python-dotenv httpx
 
-      - name: Build executable
+      - name: Create .env file
         run: |
-          python -m PyInstaller --onefile --windowed --name L2M_AutoKey --add-data "assets;assets" --add-data "lang.json;." --hidden-import win32gui --hidden-import win32con --hidden-import win32api --hidden-import win32process --hidden-import pywintypes --hidden-import cv2 --hidden-import mss --hidden-import PIL --hidden-import numpy main.py
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
+          echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> .env
 
-      - name: Get version from tag
-        id: version
-        shell: bash
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Build Windows executable
+        run: |
+          python -m PyInstaller --onefile --windowed --name L2M_AutoKey --add-data "assets;assets" --add-data ".env;." --add-data "lang.json;." --hidden-import supabase --hidden-import dotenv --hidden-import postgrest --hidden-import gotrue --hidden-import realtime --hidden-import storage3 --hidden-import supafunc --hidden-import httpx --hidden-import win32gui --hidden-import win32con --hidden-import win32api --hidden-import win32process --hidden-import pywintypes --hidden-import cv2 --hidden-import mss --hidden-import PIL --hidden-import numpy main.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: L2M_AutoKey_Windows
+          path: dist/L2M_AutoKey.exe
+
+  release:
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: L2M_AutoKey_Windows
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -la artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.VERSION }}
-          name: L2M AutoKey ${{ steps.version.outputs.VERSION }}
-          body: |
-            ## L2M AutoKey ${{ steps.version.outputs.VERSION }}
-
-            ### Download
-            - `L2M_AutoKey.exe` — standalone executable (no Python needed)
-
-            ### Requirements
-            - Windows 10/11
-            - Game window visible (not minimized)
-          files: dist/L2M_AutoKey.exe
-          draft: false
-          prerelease: false
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
