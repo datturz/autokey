@@ -1,0 +1,26 @@
+# Build
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# Settings (user-specific)
+settings/
+daily_state.json
+
+# Screenshots
+screenshot_*.png
+screenshot_*.jpeg
+debug_screenshot.png
+
+# Backup files
+*.backup*
+
+# Environment
+.env
+venv/
+
+# IDE
+.vscode/
+.idea/
