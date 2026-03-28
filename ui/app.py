@@ -61,7 +61,7 @@ from ui.tab_weapon import TabWeapon
 from ui.tab_farming import TabFarming
 from ui.tab_daily import TabDaily
 
-__version__ = "1.0.9"
+__version__ = "1.1.0"
 
 
 class L2MAutoKeyApp:
@@ -1276,12 +1276,13 @@ class L2MAutoKeyApp:
     # ──────────────────────────────────────────────
 
     def _weapon_switch_loop(self):
-        """Weapon switch loop — trigger saat interval + kena hit.
+        """Weapon switch loop — fire setiap interval, tunda saat di-hit.
 
-        Priority: combat escape > radar > weapon switch.
-        Skip saat map terbuka, di kota, atau escaped.
+        - Selalu berjalan sesuai interval
+        - Saat kena hit → tunda sampai tidak diserang lagi
+        - Skip saat map terbuka, di kota, atau escaped
         """
-        last_switch = time.time()
+        last_switch = 0  # Fire immediately on first iteration
 
         while not self.stop_event.is_set():
             settings = self.tab_weapon.collect_settings()
@@ -1310,7 +1311,7 @@ class L2MAutoKeyApp:
                 self.stop_event.wait(1)
                 continue
 
-            # Skip saat sedang diserang (biar fokus combat, jangan ganti senjata)
+            # Tunda saat sedang diserang — tunggu sampai aman baru ganti senjata
             if self.is_attacked:
                 self.stop_event.wait(0.5)
                 continue
