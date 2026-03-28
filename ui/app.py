@@ -2594,12 +2594,13 @@ class L2MAutoKeyApp:
         w, h = img.size
 
         # Full template = icon (top 60%) + number (bottom 40%)
-        # Number area is bottom 40% of the matched region
-        # Add left margin (+6px) to exclude icon edge pixels that create phantom digits
+        # Crop number area CENTERED under icon, 70% width to exclude edge artifacts
+        center_x = match_x + tw // 2
+        half_crop_w = int(tw * 0.35)  # 70% of template width
         num_y1 = match_y + int(th * 0.60)
         num_y2 = min(h, match_y + th + 4)
-        num_x1 = max(0, match_x + 6)
-        num_x2 = min(w, match_x + tw - 2)
+        num_x1 = max(0, center_x - half_crop_w)
+        num_x2 = min(w, center_x + half_crop_w)
 
         crop = img.crop((num_x1, num_y1, num_x2, num_y2))
         arr = np.array(crop)
