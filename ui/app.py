@@ -61,7 +61,7 @@ from ui.tab_weapon import TabWeapon
 from ui.tab_farming import TabFarming
 from ui.tab_daily import TabDaily
 
-__version__ = "1.0.4"
+__version__ = "1.0.9"
 
 
 class L2MAutoKeyApp:

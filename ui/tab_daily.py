@@ -16,6 +16,19 @@ class TabDaily:
         self.parent = parent
         self.lang = lang
         self._unlocked = False
+        self._pending_settings = None
+
+        # Stub attributes — prevent AttributeError when locked
+        # These get replaced by real widgets when _build_ui() runs
+        self.boss_enabled = tk.BooleanVar(value=False)
+        self.zariche_enabled = tk.BooleanVar(value=False)
+        self.bulk_purchase = tk.BooleanVar(value=False)
+        self.clan_attendance = tk.BooleanVar(value=False)
+        self.daily_claim = tk.BooleanVar(value=False)
+        self.boss_status = ttk.Label(parent)
+        self.zariche_status = ttk.Label(parent)
+        self.daily_status = ttk.Label(parent)
+
         self._build_lock_screen()
 
     def _build_lock_screen(self):
