@@ -2674,6 +2674,16 @@ class L2MAutoKeyApp:
             result = int(number_str)
         except ValueError:
             result = -1
+
+        # Sanity check: potion max ~2000, if result > 3000 likely phantom digit
+        # Strip first digit (usually phantom "5" from icon edge)
+        if result > 3000 and len(digits) > 1:
+            stripped = "".join(digits[1:])
+            stripped_val = int(stripped) if stripped else -1
+            self._log(f"[Potion] OCR: '{number_str}'→stripped '{stripped}' = {stripped_val} "
+                      f"(phantom fix) [{len(boxes)} boxes: {', '.join(box_info)}]")
+            return stripped_val
+
         self._log(f"[Potion] OCR: '{number_str}' = {result} "
                   f"[{len(boxes)} boxes: {', '.join(box_info)}] "
                   f"crop={num_x2-num_x1}x{num_y2-num_y1}px")
