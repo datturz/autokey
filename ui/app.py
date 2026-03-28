@@ -48,7 +48,7 @@ from ui.tab_weapon import TabWeapon
 from ui.tab_farming import TabFarming
 from ui.tab_daily import TabDaily
 
-__version__ = "1.0.0"
+__version__ = "1.0.4"
 
 
 class L2MAutoKeyApp:
@@ -714,7 +714,8 @@ class L2MAutoKeyApp:
                 if (radar_any_enabled
                         and not self.is_in_town
                         and self._escaped_to_town_at == 0
-                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 10):
+                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 10
+                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
                     try:
                         # Template match radar_alert.png (ini yang pernah berhasil detect)
                         if self._is_radar_alert_visible(img):
@@ -845,8 +846,9 @@ class L2MAutoKeyApp:
                 except Exception:
                     pass
 
-                # 12. Radar check FIRST (skip when in town) — prioritas utama
-                if not self.is_in_town and not self.isBlockedByMouseAction:
+                # 12. Radar check FIRST (skip when in town or recently in town) — prioritas utama
+                if (not self.is_in_town and not self.isBlockedByMouseAction
+                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
                     self._check_radar_actions(img)
 
                 # Combat Escape check (HP below threshold → weapon + skill + teleport)
@@ -1388,8 +1390,9 @@ class L2MAutoKeyApp:
 
         while not self.stop_event.is_set():
             try:
-                # Skip saat di kota atau escaped
-                if self.is_in_town or self._escaped_to_town_at > 0:
+                # Skip saat di kota, escaped, atau baru keluar dari kota (3s grace)
+                in_town_recently = (time.time() - getattr(self, 'last_in_town_time', 0)) < 3
+                if self.is_in_town or self._escaped_to_town_at > 0 or in_town_recently:
                     # Auto-reset _escaped_to_town_at setelah 60s (prevent stuck)
                     if self._escaped_to_town_at > 0 and (time.time() - self._escaped_to_town_at) > 60:
                         self._escaped_to_town_at = 0
@@ -2812,47 +2815,55 @@ class L2MAutoKeyApp:
         if not self.capturer or not self.key_sender or not self.clicker:
             return
 
-        # 1. TP to town — use dedicated potion TP key, fallback to combat escape key
-        tp_key = settings.get("potion_tp_key", "")
-        if not tp_key:
-            ce_settings = self.tab_farming.collect_settings()
-            tp_key = ce_settings.get("combat_escape_teleport_key", "")
-        if tp_key:
-            self._log("[Potion] TP ke town...")
-            self.key_sender.send(tp_key)
-            time.sleep(8)  # Loading
-        else:
-            self._log("[Potion] No TP key configured! Set 'Key TP ke town' di Auto Buy Potion")
-            return
-
-        # 2. Poll until "General Merchant" appears in NPC list, then click
-        self._log("[Potion] Tunggu NPC list muncul...")
+        # Block ALL other features during entire buy flow
         self.isBlockedByMouseAction = True
         try:
-            gm_pos = self._wait_for_template_in_region(
-                "general_merchant_btn.png", timeout=15,
-                region_y_min=0.0, region_y_max=1.0,
-                region_x_min=0.0, region_x_max=0.35  # Left panel only
-            )
-            if gm_pos is None:
-                self._log("[Potion] General Merchant not found! Abort.")
+            # 1. TP to town — use dedicated potion TP key, fallback to combat escape key
+            tp_key = settings.get("potion_tp_key", "")
+            if not tp_key:
+                ce_settings = self.tab_farming.collect_settings()
+                tp_key = ce_settings.get("combat_escape_teleport_key", "")
+            if tp_key:
+                self._log("[Potion] TP ke town...")
+                self.key_sender.send(tp_key)
+                time.sleep(8)  # Loading
+            else:
+                self._log("[Potion] No TP key configured! Set 'Key TP ke town' di Auto Buy Potion")
                 return
 
-            self._log("[Potion] Klik General Merchant...")
-            self.clicker.click(gm_pos[0], gm_pos[1])
+            # 2. Poll General Merchant + click + verify shop open (with retry)
+            shop_opened = False
+            for attempt in range(3):
+                self._log(f"[Potion] Tunggu NPC list muncul... (attempt {attempt+1})")
+                gm_pos = self._wait_for_template_in_region(
+                    "general_merchant_btn.png", timeout=10,
+                    region_y_min=0.0, region_y_max=1.0,
+                    region_x_min=0.0, region_x_max=0.35
+                )
+                if gm_pos is None:
+                    self._log("[Potion] General Merchant not found!")
+                    continue
 
-            # 3. Wait for character to walk + shop to fully open
-            # Verify shop open via icon_inventory.png in TOP-RIGHT (Bag panel tabs)
-            self._log("[Potion] Tunggu karakter jalan ke merchant...")
-            time.sleep(3)
-            self._log("[Potion] Tunggu shop terbuka (inventory tabs)...")
-            inv_pos = self._wait_for_template_in_region(
-                "icon_inventory.png", timeout=20,
-                region_y_min=0.05, region_y_max=0.30,  # Top area
-                region_x_min=0.65, region_x_max=1.0    # Right side
-            )
-            if inv_pos is None:
-                self._log("[Potion] Shop tidak terbuka! Abort.")
+                self._log("[Potion] Klik General Merchant...")
+                self.clicker.click(gm_pos[0], gm_pos[1])
+
+                # 3. Wait for character to walk + verify shop open
+                self._log("[Potion] Tunggu karakter jalan ke merchant...")
+                time.sleep(3)
+                self._log("[Potion] Tunggu shop terbuka (inventory tabs)...")
+                inv_pos = self._wait_for_template_in_region(
+                    "icon_inventory.png", timeout=12,
+                    region_y_min=0.05, region_y_max=0.30,
+                    region_x_min=0.65, region_x_max=1.0
+                )
+                if inv_pos is not None:
+                    shop_opened = True
+                    break
+                else:
+                    self._log("[Potion] Shop tidak terbuka, retry klik GM...")
+
+            if not shop_opened:
+                self._log("[Potion] Shop gagal terbuka setelah 3x retry! Abort.")
                 return
 
             self._log("[Potion] Shop terbuka!")
@@ -2907,12 +2918,25 @@ class L2MAutoKeyApp:
             # 7. Close shop — click close.jpg button (top-right of shop)
             self._log("[Potion] Tutup shop...")
             close_pos = self._wait_for_template_in_region(
-                "close.jpg", timeout=5,
-                region_y_min=0.0, region_y_max=0.15,
-                region_x_min=0.60, region_x_max=1.0
+                "close.jpg", timeout=5, threshold=0.6,
+                region_y_min=0.0, region_y_max=0.20,
+                region_x_min=0.50, region_x_max=1.0
             )
+            if close_pos is None:
+                # Try close_640.jpg as fallback
+                close_pos = self._wait_for_template_in_region(
+                    "close_640.jpg", timeout=3, threshold=0.6,
+                    region_y_min=0.0, region_y_max=0.20,
+                    region_x_min=0.50, region_x_max=1.0
+                )
             if close_pos is not None:
+                self._log(f"[Potion] Close button found, klik...")
                 self.clicker.click(close_pos[0], close_pos[1])
+                time.sleep(1)
+            else:
+                # Fallback: Escape sekali untuk tutup shop
+                self._log("[Potion] Close button not found, fallback Escape...")
+                self.key_sender.send("Escape")
                 time.sleep(1)
 
             self._log("[Potion] Beli selesai!")
@@ -2922,11 +2946,13 @@ class L2MAutoKeyApp:
         finally:
             self.isBlockedByMouseAction = False
 
-        # 7. TP back to farm
-        if settings.get("auto_teleport_enabled"):
-            self._log("[Potion] TP ke farm...")
-            self._teleport_to_spot(settings)
-            self.do_auto_hunt = True
+        # Setelah beli selesai, set town state
+        # Biarkan feature "teleport setelah di kota" yang handle TP back ke farm
+        self.is_in_town = True
+        self.last_in_town_time = time.time()
+        self._escaped_to_town_at = time.time()  # Trigger 1 (escape-based TP back)
+        self.do_auto_hunt = True
+        self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
 
     def _wait_for_template_in_region(self, template_name: str, timeout: int = 15,
                                         threshold: float = 0.7,

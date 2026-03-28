@@ -1,10 +1,12 @@
 """Daily tasks tab - boss check, clan attendance, etc."""
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, simpledialog, messagebox
 from core.key_sender import KEY_LIST
 
 # Area list dan koordinat Y @1280x720 di panel kiri map
 AREA_LIST = ["ALL", "Gludio", "Dion", "Giran", "Oren", "Aden"]
+
+_ACCESS_KEY = "DAWNSHATTER"
 
 
 class TabDaily:
@@ -13,7 +15,31 @@ class TabDaily:
     def __init__(self, parent: ttk.Frame, lang: dict):
         self.parent = parent
         self.lang = lang
-        self._build_ui()
+        self._unlocked = False
+        self._build_lock_screen()
+
+    def _build_lock_screen(self):
+        """Show lock screen until correct password is entered."""
+        self._lock_frame = ttk.Frame(self.parent)
+        self._lock_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(self._lock_frame, text="🔒 Feature ini memerlukan akses khusus",
+                  font=("", 12)).pack(pady=(80, 10))
+        ttk.Button(self._lock_frame, text="Unlock",
+                   command=self._on_unlock).pack(pady=10)
+
+    def _on_unlock(self):
+        pwd = simpledialog.askstring("Access Key", "Masukkan access key:",
+                                     show="*", parent=self.parent)
+        if pwd == _ACCESS_KEY:
+            self._unlocked = True
+            self._lock_frame.destroy()
+            self._build_ui()
+            # Apply any pending settings that were loaded before unlock
+            if hasattr(self, '_pending_settings') and self._pending_settings:
+                self.apply_settings(self._pending_settings)
+                self._pending_settings = None
+        elif pwd is not None:
+            messagebox.showerror("Error", "Access key salah!", parent=self.parent)
 
     def _build_ui(self):
         # Boss check
@@ -116,6 +142,9 @@ class TabDaily:
         self.daily_status.pack(anchor=tk.W, pady=2)
 
     def apply_settings(self, settings: dict):
+        if not self._unlocked:
+            self._pending_settings = settings
+            return
         self.boss_enabled.set(settings.get("check_boss_enabled", False))
         self.boss_interval.delete(0, tk.END)
         self.boss_interval.insert(0, str(settings.get("check_boss_interval", 5)))
@@ -147,6 +176,8 @@ class TabDaily:
         self.daily_claim.set(settings.get("auto_daily_claim", False))
 
     def collect_settings(self) -> dict:
+        if not self._unlocked:
+            return {}
         return {
             "check_boss_enabled": self.boss_enabled.get(),
             "check_boss_interval": int(self.boss_interval.get() or 5),
