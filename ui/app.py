@@ -1310,8 +1310,8 @@ class L2MAutoKeyApp:
                 self.stop_event.wait(1)
                 continue
 
-            # Tunggu sampai kena hit (is_attacked) baru fire
-            if not self.is_attacked:
+            # Skip saat sedang diserang (biar fokus combat, jangan ganti senjata)
+            if self.is_attacked:
                 self.stop_event.wait(0.5)
                 continue
 
