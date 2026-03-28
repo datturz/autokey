@@ -2465,103 +2465,258 @@ class L2MAutoKeyApp:
     #  Auto Buy Potion
     # ──────────────────────────────────────────────
 
-    def _read_potion_count(self, img, pos_x_pct: float, pos_y_pct: float) -> int:
-        """Read potion count from hotbar using OCR (digit recognition).
+    def _find_potion_icon(self, img):
+        """Find potion icon on screen via template matching with potion_icon.png.
 
-        Crops area around potion icon position and reads white digit text.
-        Uses thresholding + contour analysis to extract digits.
+        Uses only the ICON portion (top 50%) for matching — the number part
+        changes and would bias the match position. Searches only the consumable
+        hotbar area (bottom 25%, x: 25-75%) to avoid skill bar false matches.
 
-        Returns potion count, or -1 if cannot read.
+        Returns (match_x, match_y, full_tw, full_th) where full_tw/full_th are
+        the FULL template dimensions (icon+number), so caller can crop number area.
         """
+        if not hasattr(self, '_potion_icon_tpl'):
+            self._potion_icon_tpl = None
+            self._potion_full_th = 0
+            self._potion_full_tw = 0
+            path = os.path.join("assets", "potion_icon.png")
+            if os.path.exists(path):
+                data = load_image(path)
+                if data is not None:
+                    tpl_bgr, tpl_mask = data
+                    self._potion_full_th, self._potion_full_tw = tpl_bgr.shape[:2]
+                    # Create mask: top 60% = white (match), bottom 40% = black (ignore)
+                    # This way we match the icon but ignore the changing number
+                    icon_mask = np.zeros(tpl_bgr.shape[:2], dtype=np.uint8)
+                    cut_h = int(tpl_bgr.shape[0] * 0.60)
+                    icon_mask[:cut_h, :] = 255
+                    # Convert to 3-channel mask for matchTemplate
+                    icon_mask_3ch = cv2.merge([icon_mask, icon_mask, icon_mask])
+                    self._potion_icon_tpl = (tpl_bgr, icon_mask_3ch)
+
+        if self._potion_icon_tpl is None:
+            return None
+
+        tpl_bgr, tpl_mask = self._potion_icon_tpl
         w, h = img.size
-        # Crop region around potion number (below icon)
-        cx = int(pos_x_pct / 100.0 * w)
-        cy = int(pos_y_pct / 100.0 * h)
-        # Number is below/on the icon, crop a small box
-        margin_x = int(w * 0.04)
-        margin_y = int(h * 0.03)
-        x1 = max(0, cx - margin_x)
-        y1 = max(0, cy - margin_y)
-        x2 = min(w, cx + margin_x)
-        y2 = min(h, cy + margin_y)
+        img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        crop = img.crop((x1, y1, x2, y2))
+        # Search only consumable hotbar: bottom 25% height, x: 25-75% width
+        search_y = int(h * 0.75)
+        search_x1 = int(w * 0.25)
+        search_x2 = int(w * 0.75)
+        search_img = img_bgr[search_y:, search_x1:search_x2]
+        sh, sw = search_img.shape[:2]
+
+        # Scale template + mask to match current resolution
+        scale = h / 720.0
+        th, tw = tpl_bgr.shape[:2]
+        full_th = int(self._potion_full_th * scale) if abs(scale - 1.0) > 0.05 else self._potion_full_th
+        full_tw = int(self._potion_full_tw * scale) if abs(scale - 1.0) > 0.05 else self._potion_full_tw
+        s_tpl = tpl_bgr
+        s_mask = tpl_mask
+        if abs(scale - 1.0) > 0.05:
+            nw = max(1, int(tw * scale))
+            nh = max(1, int(th * scale))
+            if nw < sw and nh < sh:
+                s_tpl = cv2.resize(tpl_bgr, (nw, nh))
+                s_mask = cv2.resize(tpl_mask, (nw, nh))
+                th, tw = nh, nw
+
+        if th > sh or tw > sw:
+            return None
+
+        # Match with mask: only icon portion is compared, number area ignored
+        result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        if max_val >= 0.60:
+            # Return match top-left + template size (full template with mask)
+            match_x = search_x1 + max_loc[0]
+            match_y = search_y + max_loc[1]
+            self._log(f"[Potion] Icon found (score={max_val:.2f}) at ({match_x},{match_y})")
+            return (match_x, match_y, tw, th)
+
+        # Debug when not found
+        if not hasattr(self, '_potion_find_debug'):
+            self._potion_find_debug = 0
+        if self._potion_find_debug < 3:
+            self._potion_find_debug += 1
+            try:
+                debug_dir = os.path.join("debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                from PIL import Image, ImageDraw
+                debug_img = img.copy()
+                draw = ImageDraw.Draw(debug_img)
+                bx = search_x1 + max_loc[0]
+                by = search_y + max_loc[1]
+                draw.rectangle([bx, by, bx + tw, by + th], outline="yellow", width=2)
+                # Search area boundary (blue)
+                draw.rectangle([search_x1, search_y, search_x2, h], outline="blue", width=1)
+                debug_img.save(os.path.join(debug_dir, f"potion_find_fail_{self._potion_find_debug}.png"))
+                self._log(f"[Potion] Debug: best at ({bx},{by}) score={max_val:.2f}")
+            except Exception:
+                pass
+
+        self._log(f"[Potion] Icon NOT found (best score={max_val:.2f})")
+        return None
+
+    def _read_potion_count(self, img) -> int:
+        """Find potion icon via template match, then read number below it.
+
+        _find_potion_icon returns (match_x, match_y, full_tw, full_th) where
+        match_x/y is top-left of the ICON match, and full_tw/th is the full
+        template size (icon+number). The number is in the bottom ~45% of the
+        full template area.
+
+        Returns actual number via OCR, or -1 if cannot find/read.
+        """
+        icon_pos = self._find_potion_icon(img)
+        if icon_pos is None:
+            return -1
+
+        match_x, match_y, tw, th = icon_pos
+        w, h = img.size
+
+        # Full template = icon (top 60%) + number (bottom 40%)
+        # Number area is bottom 40% of the matched region
+        num_y1 = match_y + int(th * 0.60)
+        num_y2 = min(h, match_y + th + 4)
+        num_x1 = max(0, match_x - 2)
+        num_x2 = min(w, match_x + tw + 2)
+
+        crop = img.crop((num_x1, num_y1, num_x2, num_y2))
         arr = np.array(crop)
-        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-        # Threshold: white text on dark background
-        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        # Use MAX channel — catches red/yellow/white text
+        # Try threshold 200 first; if too few digits found, retry with 170
+        # (lower threshold needed when potion icon is dimmed during auto-use animation)
+        max_channel = np.max(arr, axis=2)
+        _, thresh = cv2.threshold(max_channel, 200, 255, cv2.THRESH_BINARY)
+
+        # Check if we got enough contours; if not, retry with lower threshold
+        test_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        test_boxes = [cv2.boundingRect(c) for c in test_contours]
+        test_boxes = [(x, y, bw, bh) for x, y, bw, bh in test_boxes
+                      if bh > thresh.shape[0] * 0.20 and bw >= 1]
+        if len(test_boxes) < 2:
+            # Too few digits — icon may be dimmed, use lower threshold
+            _, thresh = cv2.threshold(max_channel, 170, 255, cv2.THRESH_BINARY)
+
+        # Debug: save first 5 times
+        if not hasattr(self, '_potion_debug_count'):
+            self._potion_debug_count = 0
+        if self._potion_debug_count < 5:
+            self._potion_debug_count += 1
+            try:
+                debug_dir = os.path.join("debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                crop.save(os.path.join(debug_dir, f"potion_crop_{self._potion_debug_count}.png"))
+                from PIL import Image, ImageDraw
+                Image.fromarray(thresh).save(os.path.join(debug_dir, f"potion_thresh_{self._potion_debug_count}.png"))
+                debug_full = img.copy()
+                draw = ImageDraw.Draw(debug_full)
+                # Icon match area (green) — top 60% where mask is active
+                draw.rectangle([match_x, match_y, match_x + tw, match_y + int(th * 0.60)],
+                               outline="green", width=2)
+                # Number crop area (red)
+                draw.rectangle([num_x1, num_y1, num_x2, num_y2],
+                               outline="red", width=3)
+                debug_full.save(os.path.join(debug_dir, f"potion_fullscreen_{self._potion_debug_count}.png"))
+                self._log(f"[Potion] Debug saved: debug/potion_fullscreen_{self._potion_debug_count}.png")
+            except Exception:
+                pass
 
         # Find contours (each digit)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return -1
 
-        # Sort contours left-to-right
+        crop_h, crop_w = thresh.shape[:2]
         boxes = []
         for cnt in contours:
             bx, by, bw, bh = cv2.boundingRect(cnt)
-            # Filter noise: digit must be tall enough
-            if bh > gray.shape[0] * 0.3 and bw > 2:
+            if bh > crop_h * 0.20 and bw >= 1:
                 boxes.append((bx, by, bw, bh))
         boxes.sort(key=lambda b: b[0])
 
         if not boxes:
             return -1
 
-        # Simple digit recognition via aspect ratio + pixel patterns
-        # For robustness, count total white pixels as rough size indicator
+        # OCR each digit using bitmap template matching
         digits = []
         for bx, by, bw, bh in boxes:
-            digit_crop = thresh[by:by+bh, bx:bx+bw]
-            white_ratio = np.sum(digit_crop > 0) / digit_crop.size if digit_crop.size > 0 else 0
+            if bw < 1 or bh < 2:
+                continue
+            d = self._recognize_digit(thresh[by:by+bh, bx:bx+bw])
+            digits.append(str(d))
 
-            # Rough digit classification by aspect ratio and density
-            aspect = bw / bh if bh > 0 else 0
-            if aspect < 0.3:
-                digits.append('1')
-            elif white_ratio > 0.65:
-                digits.append('0' if aspect > 0.5 else '8')
-            elif white_ratio > 0.50:
-                digits.append('6')
-            elif white_ratio > 0.40:
-                digits.append('5')
-            elif white_ratio > 0.30:
-                digits.append('3')
-            else:
-                digits.append('7')
+        number_str = "".join(digits)
+        try:
+            result = int(number_str)
+        except ValueError:
+            result = -1
+        self._log(f"[Potion] OCR: '{number_str}' = {result}")
+        return result
 
-        # Fallback: just count total white pixels as magnitude
-        total_white = np.sum(thresh > 0)
-        total_pixels = thresh.size
+    # 5x7 reference bitmaps for digits 0-9 (1=white, 0=black)
+    _DIGIT_REFS = None
 
-        # Better approach: use the number of digit-sized contours as magnitude
-        num_digits = len(boxes)
-        if num_digits == 0:
-            return -1
+    @classmethod
+    def _get_digit_refs(cls):
+        if cls._DIGIT_REFS is not None:
+            return cls._DIGIT_REFS
+        raw = {
+            0: ["01110","10001","10001","10001","10001","10001","01110"],
+            1: ["00100","01100","00100","00100","00100","00100","01110"],
+            2: ["01110","10001","00001","00110","01000","10000","11111"],
+            3: ["01110","10001","00001","00110","00001","10001","01110"],
+            4: ["00110","01010","10010","11111","00010","00010","00010"],
+            5: ["11111","10000","11110","00001","00001","10001","01110"],
+            6: ["00110","01000","10000","11110","10001","10001","01110"],
+            7: ["11111","00001","00010","00100","01000","01000","01000"],
+            8: ["01110","10001","10001","01110","10001","10001","01110"],
+            9: ["01110","10001","10001","01111","00001","00010","01100"],
+        }
+        cls._DIGIT_REFS = {}
+        for d, rows in raw.items():
+            bitmap = np.array([[int(c) for c in row] for row in rows], dtype=np.float32)
+            cls._DIGIT_REFS[d] = bitmap
+        return cls._DIGIT_REFS
 
-        # Rough estimation: 1 digit=1-9, 2 digits=10-99, 3 digits=100-999, 4+=1000+
-        # For threshold check, we just need to know if it's below N
-        # Use white pixel density as proxy for the actual number
-        # More white = bigger number
-        white_density = total_white / total_pixels if total_pixels > 0 else 0
+    @classmethod
+    def _recognize_digit(cls, digit_img) -> int:
+        """Recognize a digit by resizing to 5x7 and correlating with references."""
+        h, w = digit_img.shape
+        if h < 2 or w < 1:
+            return 0
 
-        # Estimate: map density to rough count based on digit count
-        if num_digits >= 4:
-            return 1000  # 4+ digits = >1000
-        elif num_digits == 3:
-            return int(white_density * 999)
-        elif num_digits == 2:
-            return int(white_density * 99)
-        else:
-            return int(white_density * 9)
+        # Very thin = "1"
+        if w / h < 0.45:
+            return 1
+
+        # Resize to 5x7, normalize to 0-1
+        resized = cv2.resize(digit_img, (5, 7), interpolation=cv2.INTER_AREA)
+        norm = resized.astype(np.float32) / 255.0
+
+        # Compare against each reference bitmap
+        refs = cls._get_digit_refs()
+        best_d, best_score = 0, -999
+        for d, ref in refs.items():
+            # Correlation: sum of element-wise product minus non-matching
+            score = np.sum(norm * ref) - np.sum(norm * (1 - ref)) * 0.5
+            if score > best_score:
+                best_score = score
+                best_d = d
+
+        return best_d
 
     def _check_auto_potion(self, settings: dict, now: float):
         """Check potion count and auto-buy if below threshold.
 
         Flow:
         1. Read potion count from hotbar (OCR)
-        2. If below threshold → TP to town
+        2. If below threshold 2x consecutive → TP to town
         3. Click "General Merchant" from NPC list
         4. Wait for shop → click "Auto-Trade" → "Confirm"
         5. TP back to farm
@@ -2578,29 +2733,67 @@ class L2MAutoKeyApp:
             return
         self._potion_last_check = now
 
-        # Read potion count
-        img = self._last_img_for_checks
+        # Read potion count — capture fresh image to avoid stale/obscured screen
+        img = self.capturer.capture()
         if img is None:
             return
 
-        pos_x = settings.get("potion_pos_x", 75.0)
-        pos_y = settings.get("potion_pos_y", 92.0)
         threshold = settings.get("potion_threshold", 100)
 
-        count = self._read_potion_count(img, pos_x, pos_y)
+        count = self._read_potion_count(img)
         self._log(f"[Potion] Count: {count} (threshold: {threshold})")
 
         if count < 0:
-            return  # Cannot read
+            # Cannot read (icon blocked by effects) — DON'T reset counter, just skip
+            # Recheck sooner (5s) in case effects clear
+            self._potion_last_check = now - interval_sec + 5
+            return
         if count >= threshold:
+            self._potion_low_count = 0
             self.root.after(0, self.tab_farming.potion_status.config,
                             {"text": f"Potion: {count} OK"})
             return
 
+        # Count is low — require 2 consecutive low reads to avoid false triggers
+        if not hasattr(self, '_potion_low_count'):
+            self._potion_low_count = 0
+        self._potion_low_count += 1
+
+        if self._potion_low_count < 2:
+            self._log(f"[Potion] Low read #{self._potion_low_count}, rechecking in 10s...")
+            self._potion_last_check = now - interval_sec + 10  # Recheck in 10s
+            return
+
+        # Confirmed low — double-check with multiple retries (effects may block icon)
+        confirm_ok = False
+        for retry in range(5):
+            time.sleep(1)
+            img2 = self.capturer.capture()
+            if img2 is None:
+                continue
+            count2 = self._read_potion_count(img2)
+            self._log(f"[Potion] Confirm read #{retry+1}: {count2}")
+            if count2 >= threshold:
+                self._log("[Potion] False alarm — confirm read above threshold")
+                self._potion_low_count = 0
+                return
+            if count2 >= 0:
+                # Got a valid reading that's still below threshold
+                confirm_ok = True
+                break
+            # count2 == -1: icon blocked, retry
+
+        if not confirm_ok:
+            self._log("[Potion] Could not confirm — icon blocked, will retry later")
+            self._potion_last_check = now - interval_sec + 15
+            return
+
+        self._potion_low_count = 0
+
         # Potion low! Buy sequence
-        self._log(f"[Potion] LOW! {count} < {threshold} → TP ke town + buy")
+        self._log(f"[Potion] LOW! ~{count} < {threshold} → TP ke town + buy")
         self.root.after(0, self.tab_farming.potion_status.config,
-                        {"text": f"Potion LOW: {count} → buying..."})
+                        {"text": f"Potion LOW: ~{count} → buying..."})
 
         self._auto_buy_potion(settings)
 
@@ -2608,10 +2801,10 @@ class L2MAutoKeyApp:
         """TP to town, buy potion from General Merchant, TP back.
 
         Flow:
-        1. TP to town (escape key)
+        1. TP to town (potion_tp_key or fallback combat_escape_teleport_key)
         2. Wait loading
         3. Click "General Merchant" from NPC list (template match)
-        4. Wait character walk to merchant + shop open
+        4. Wait for shop open (verify icon_inventory.png template)
         5. Click "Auto-Trade" → "Confirm"
         6. Close shop (Escape)
         7. TP back to farm
@@ -2619,84 +2812,108 @@ class L2MAutoKeyApp:
         if not self.capturer or not self.key_sender or not self.clicker:
             return
 
-        # 1. TP to town
-        ce_settings = self.tab_farming.collect_settings()
-        tp_key = ce_settings.get("combat_escape_teleport_key", "")
+        # 1. TP to town — use dedicated potion TP key, fallback to combat escape key
+        tp_key = settings.get("potion_tp_key", "")
+        if not tp_key:
+            ce_settings = self.tab_farming.collect_settings()
+            tp_key = ce_settings.get("combat_escape_teleport_key", "")
         if tp_key:
             self._log("[Potion] TP ke town...")
             self.key_sender.send(tp_key)
             time.sleep(8)  # Loading
         else:
-            self._log("[Potion] No TP key configured!")
+            self._log("[Potion] No TP key configured! Set 'Key TP ke town' di Auto Buy Potion")
             return
 
-        # 2. Click "General Merchant" from NPC list
-        self._log("[Potion] Klik General Merchant...")
+        # 2. Poll until "General Merchant" appears in NPC list, then click
+        self._log("[Potion] Tunggu NPC list muncul...")
         self.isBlockedByMouseAction = True
         try:
-            # Template match general_merchant_btn in left panel
-            img = self.capturer.capture()
-            if img is None:
+            gm_pos = self._wait_for_template_in_region(
+                "general_merchant_btn.png", timeout=15,
+                region_y_min=0.0, region_y_max=1.0,
+                region_x_min=0.0, region_x_max=0.35  # Left panel only
+            )
+            if gm_pos is None:
+                self._log("[Potion] General Merchant not found! Abort.")
                 return
 
-            merchant_tpl = None
-            path = os.path.join("assets", "general_merchant_btn.png")
-            if os.path.exists(path):
-                merchant_tpl = load_image(path)
+            self._log("[Potion] Klik General Merchant...")
+            self.clicker.click(gm_pos[0], gm_pos[1])
 
-            if merchant_tpl:
-                tpl_bgr, tpl_mask = merchant_tpl
-                w, h = img.size
-                # Search in left panel (0-30% width)
-                rx2 = int(w * 0.30)
-                crop = img.crop((0, 0, rx2, h))
-                crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
-                ch, cw = crop_bgr.shape[:2]
+            # 3. Wait for character to walk + shop to fully open
+            # Verify shop open via icon_inventory.png in TOP-RIGHT (Bag panel tabs)
+            self._log("[Potion] Tunggu karakter jalan ke merchant...")
+            time.sleep(3)
+            self._log("[Potion] Tunggu shop terbuka (inventory tabs)...")
+            inv_pos = self._wait_for_template_in_region(
+                "icon_inventory.png", timeout=20,
+                region_y_min=0.05, region_y_max=0.30,  # Top area
+                region_x_min=0.65, region_x_max=1.0    # Right side
+            )
+            if inv_pos is None:
+                self._log("[Potion] Shop tidak terbuka! Abort.")
+                return
 
-                scale = h / 720.0
-                th, tw = tpl_bgr.shape[:2]
-                if abs(scale - 1.0) > 0.05:
-                    nw = max(1, int(tw * scale))
-                    nh = max(1, int(th * scale))
-                    if nw < cw and nh < ch:
-                        tpl_bgr = cv2.resize(tpl_bgr, (nw, nh))
-                        tpl_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
-                        th, tw = nh, nw
-
-                if th <= ch and tw <= cw:
-                    if tpl_mask is not None:
-                        result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCORR_NORMED, mask=tpl_mask)
-                    else:
-                        result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-                    if max_val >= 0.7:
-                        cx = max_loc[0] + tw // 2
-                        cy = max_loc[1] + th // 2
-                        self.clicker.click(cx, cy)
-                        self._log(f"[Potion] General Merchant found (score={max_val:.2f})")
-                    else:
-                        self._log(f"[Potion] General Merchant not found (score={max_val:.2f})")
-                        return
-
-            # 3. Wait character walk to merchant + shop opens
-            self._log("[Potion] Tunggu shop terbuka...")
-            time.sleep(8)
-
-            # 4. Click "Auto-Trade"
-            self._log("[Potion] Klik Auto-Trade...")
-            # Auto-Trade button at bottom-right area @1280x720
-            self.clicker.click_scaled(1000, 700)
-            time.sleep(2)
-
-            # 5. Click "Confirm"
-            self._log("[Potion] Klik Confirm...")
-            self.clicker.click_scaled(1190, 700)
-            time.sleep(2)
-
-            # 6. Close shop
-            self.key_sender.send("Escape")
+            self._log("[Potion] Shop terbuka!")
             time.sleep(1)
+
+            # Find Auto-Trade button in bottom-right
+            at_pos = self._wait_for_template_in_region(
+                "auto_trade_btn.png", timeout=5,
+                region_y_min=0.70, region_y_max=1.0,
+                region_x_min=0.70, region_x_max=1.0
+            )
+            if at_pos is None:
+                self._log("[Potion] Auto-Trade btn not found! Abort.")
+                return
+
+            # 4. Click Auto-Trade button
+            self._log("[Potion] Klik Auto-Trade...")
+            self.clicker.click(at_pos[0], at_pos[1])
+            time.sleep(2)
+
+            # 5. Click Confirm in shop (orange button next to Auto-Trade)
+            self._log("[Potion] Cari Confirm di shop...")
+            cf_pos = self._wait_for_template_in_region(
+                "confirm_trade_btn.png", timeout=5,
+                region_y_min=0.70, region_y_max=1.0,
+                region_x_min=0.60, region_x_max=1.0
+            )
+            if cf_pos is not None:
+                # Template shows "-Trade | Confirm" — click RIGHT portion (Confirm)
+                self._log("[Potion] Klik Confirm di shop...")
+                self.clicker.click(cf_pos[0] + 40, cf_pos[1])
+                time.sleep(2)
+            else:
+                self._log("[Potion] Confirm shop not found!")
+                return
+
+            # 6. Wait for confirm DIALOG popup, click Confirm in dialog
+            self._log("[Potion] Tunggu confirm dialog...")
+            dlg_pos = self._wait_for_template_in_region(
+                "confirm_diaglog.jpg", timeout=5,
+                region_y_min=0.30, region_y_max=0.80,
+                region_x_min=0.25, region_x_max=0.80
+            )
+            if dlg_pos is not None:
+                # Template shows "Cancel | Confirm" — click RIGHT portion (Confirm)
+                self._log("[Potion] Klik Confirm di dialog...")
+                self.clicker.click(dlg_pos[0] + 40, dlg_pos[1])
+                time.sleep(3)
+            else:
+                self._log("[Potion] Confirm dialog not found, lanjut...")
+
+            # 7. Close shop — click close.jpg button (top-right of shop)
+            self._log("[Potion] Tutup shop...")
+            close_pos = self._wait_for_template_in_region(
+                "close.jpg", timeout=5,
+                region_y_min=0.0, region_y_max=0.15,
+                region_x_min=0.60, region_x_max=1.0
+            )
+            if close_pos is not None:
+                self.clicker.click(close_pos[0], close_pos[1])
+                time.sleep(1)
 
             self._log("[Potion] Beli selesai!")
             self.root.after(0, self.tab_farming.potion_status.config,
@@ -2710,6 +2927,125 @@ class L2MAutoKeyApp:
             self._log("[Potion] TP ke farm...")
             self._teleport_to_spot(settings)
             self.do_auto_hunt = True
+
+    def _wait_for_template_in_region(self, template_name: str, timeout: int = 15,
+                                        threshold: float = 0.7,
+                                        region_y_min: float = 0.0, region_y_max: float = 1.0,
+                                        region_x_min: float = 0.0, region_x_max: float = 1.0):
+        """Wait until template is visible in a specific screen region.
+
+        Region is specified as fractions (0.0-1.0) of screen width/height.
+        Returns (cx, cy) in FULL screen coordinates, or None if timeout.
+        """
+        tpl_path = os.path.join("assets", template_name)
+        if not os.path.exists(tpl_path):
+            self._log(f"[Potion] Template {template_name} not found")
+            return None
+
+        tpl_data = load_image(tpl_path)
+        if tpl_data is None:
+            return None
+
+        tpl_bgr, tpl_mask = tpl_data
+        start = time.time()
+        while (time.time() - start) < timeout:
+            time.sleep(1)
+            img = self.capturer.capture()
+            if img is None:
+                continue
+
+            w, h = img.size
+            img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+            # Crop to search region
+            ry1 = int(h * region_y_min)
+            ry2 = int(h * region_y_max)
+            rx1 = int(w * region_x_min)
+            rx2 = int(w * region_x_max)
+            search_img = img_bgr[ry1:ry2, rx1:rx2]
+            sh, sw = search_img.shape[:2]
+
+            scale = h / 720.0
+            th, tw = tpl_bgr.shape[:2]
+            s_tpl = tpl_bgr
+            s_mask = tpl_mask
+            if abs(scale - 1.0) > 0.05:
+                nw = max(1, int(tw * scale))
+                nh = max(1, int(th * scale))
+                if nw < sw and nh < sh:
+                    s_tpl = cv2.resize(tpl_bgr, (nw, nh))
+                    s_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
+                    th, tw = nh, nw
+
+            if th <= sh and tw <= sw:
+                if s_mask is not None:
+                    result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+                else:
+                    result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                if max_val >= threshold:
+                    # Convert back to full screen coordinates
+                    cx = rx1 + max_loc[0] + tw // 2
+                    cy = ry1 + max_loc[1] + th // 2
+                    self._log(f"[Potion] {template_name} found (score={max_val:.2f}) at ({cx},{cy})")
+                    return (cx, cy)
+
+        return None
+
+    def _wait_for_template(self, template_name: str, timeout: int = 15, threshold: float = 0.7):
+        """Wait until template is visible on screen.
+
+        Returns (cx, cy) center position if found, None if timeout.
+        """
+        tpl_path = os.path.join("assets", template_name)
+        if not os.path.exists(tpl_path):
+            self._log(f"[Potion] Template {template_name} not found, fallback wait 8s")
+            time.sleep(8)
+            return None
+
+        tpl_data = load_image(tpl_path)
+        if tpl_data is None:
+            time.sleep(8)
+            return None
+
+        tpl_bgr, tpl_mask = tpl_data
+        start = time.time()
+        while (time.time() - start) < timeout:
+            time.sleep(1)
+            img = self.capturer.capture()
+            if img is None:
+                continue
+
+            w, h = img.size
+            img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+            scale = h / 720.0
+            th, tw = tpl_bgr.shape[:2]
+            s_tpl = tpl_bgr
+            s_mask = tpl_mask
+            if abs(scale - 1.0) > 0.05:
+                nw = max(1, int(tw * scale))
+                nh = max(1, int(th * scale))
+                if nw < w and nh < h:
+                    s_tpl = cv2.resize(tpl_bgr, (nw, nh))
+                    s_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
+                    th, tw = nh, nw
+
+            if th <= h and tw <= w:
+                if s_mask is not None:
+                    result = cv2.matchTemplate(img_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+                else:
+                    result = cv2.matchTemplate(img_bgr, s_tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                if max_val >= threshold:
+                    cx = max_loc[0] + tw // 2
+                    cy = max_loc[1] + th // 2
+                    self._log(f"[Potion] {template_name} found (score={max_val:.2f}) at ({cx},{cy})")
+                    return (cx, cy)
+
+        return None
 
     def _is_saved_spots_dialog_open(self, img) -> bool:
         """Check if saved spots dialog is currently open using template matching.

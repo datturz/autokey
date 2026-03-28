@@ -145,18 +145,16 @@ class TabFarming:
 
         pot_row2 = ttk.Frame(potion_frame)
         pot_row2.pack(fill=tk.X, pady=2)
-        ttk.Label(pot_row2, text="Posisi potion X%:").pack(side=tk.LEFT)
-        self.potion_x = ttk.Entry(pot_row2, width=6)
-        self.potion_x.pack(side=tk.LEFT, padx=2)
-        self.potion_x.insert(0, "75.0")
-        ttk.Label(pot_row2, text="Y%:").pack(side=tk.LEFT)
-        self.potion_y = ttk.Entry(pot_row2, width=6)
-        self.potion_y.pack(side=tk.LEFT, padx=2)
-        self.potion_y.insert(0, "92.0")
-        ttk.Label(pot_row2, text="Cek setiap (menit):").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(pot_row2, text="Cek setiap (menit):").pack(side=tk.LEFT)
         self.potion_check_interval = ttk.Entry(pot_row2, width=5)
         self.potion_check_interval.pack(side=tk.LEFT, padx=2)
         self.potion_check_interval.insert(0, "5")
+
+        pot_row3 = ttk.Frame(potion_frame)
+        pot_row3.pack(fill=tk.X, pady=2)
+        ttk.Label(pot_row3, text="Key TP ke town:").pack(side=tk.LEFT)
+        self.potion_tp_key = ttk.Combobox(pot_row3, values=[""] + KEY_LIST, width=6, state="readonly")
+        self.potion_tp_key.pack(side=tk.LEFT, padx=5)
 
         self.potion_status = ttk.Label(potion_frame, text="")
         self.potion_status.pack(anchor=tk.W, pady=2)
@@ -214,12 +212,10 @@ class TabFarming:
         self.auto_potion_enabled.set(settings.get("auto_potion_enabled", False))
         self.potion_threshold.delete(0, tk.END)
         self.potion_threshold.insert(0, str(settings.get("potion_threshold", 100)))
-        self.potion_x.delete(0, tk.END)
-        self.potion_x.insert(0, str(settings.get("potion_pos_x", 75.0)))
-        self.potion_y.delete(0, tk.END)
-        self.potion_y.insert(0, str(settings.get("potion_pos_y", 92.0)))
         self.potion_check_interval.delete(0, tk.END)
         self.potion_check_interval.insert(0, str(settings.get("potion_check_interval", 5)))
+        if settings.get("potion_tp_key"):
+            self.potion_tp_key.set(settings["potion_tp_key"])
         self.combat_escape_enabled.set(settings.get("combat_escape_enabled", False))
         self.ce_hp_threshold.delete(0, tk.END)
         self.ce_hp_threshold.insert(0, str(settings.get("combat_escape_hp", 50)))
@@ -269,9 +265,8 @@ class TabFarming:
             "auto_buy_items": self.auto_buy.get(),
             "auto_potion_enabled": self.auto_potion_enabled.get(),
             "potion_threshold": int(self.potion_threshold.get() or 100),
-            "potion_pos_x": float(self.potion_x.get() or 75.0),
-            "potion_pos_y": float(self.potion_y.get() or 92.0),
             "potion_check_interval": int(self.potion_check_interval.get() or 5),
+            "potion_tp_key": self.potion_tp_key.get(),
             "combat_escape_enabled": self.combat_escape_enabled.get(),
             "combat_escape_hp": int(self.ce_hp_threshold.get() or 50),
             "combat_escape_weapon_key": self.ce_weapon_key.get(),
