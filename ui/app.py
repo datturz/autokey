@@ -8,9 +8,22 @@ import warnings
 warnings.filterwarnings("ignore", message="data discontinuity")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 import os
+import sys
 import cv2
 import numpy as np
 import win32gui
+
+
+def _get_debug_dir():
+    """Get persistent debug directory (next to exe, not in temp _MEIPASS)."""
+    if hasattr(sys, '_MEIPASS'):
+        # Running as PyInstaller exe — save next to the exe file
+        exe_dir = os.path.dirname(sys.executable)
+        d = os.path.join(exe_dir, "debug")
+    else:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 # Suppress PIL palette warnings
 warnings.filterwarnings("ignore", message="Palette images with Transparency")
@@ -2546,8 +2559,7 @@ class L2MAutoKeyApp:
         if self._potion_find_debug < 3:
             self._potion_find_debug += 1
             try:
-                debug_dir = os.path.join("debug")
-                os.makedirs(debug_dir, exist_ok=True)
+                debug_dir = _get_debug_dir()
                 from PIL import Image, ImageDraw
                 debug_img = img.copy()
                 draw = ImageDraw.Draw(debug_img)
@@ -2606,14 +2618,13 @@ class L2MAutoKeyApp:
             # Too few digits — icon may be dimmed, use lower threshold
             _, thresh = cv2.threshold(max_channel, 170, 255, cv2.THRESH_BINARY)
 
-        # Debug: save first 5 times
+        # Debug: save first 10 times (persistent dir, survives exe restart)
         if not hasattr(self, '_potion_debug_count'):
             self._potion_debug_count = 0
-        if self._potion_debug_count < 5:
+        if self._potion_debug_count < 10:
             self._potion_debug_count += 1
             try:
-                debug_dir = os.path.join("debug")
-                os.makedirs(debug_dir, exist_ok=True)
+                debug_dir = _get_debug_dir()
                 crop.save(os.path.join(debug_dir, f"potion_crop_{self._potion_debug_count}.png"))
                 from PIL import Image, ImageDraw
                 Image.fromarray(thresh).save(os.path.join(debug_dir, f"potion_thresh_{self._potion_debug_count}.png"))
@@ -2648,18 +2659,22 @@ class L2MAutoKeyApp:
 
         # OCR each digit using bitmap template matching
         digits = []
+        box_info = []
         for bx, by, bw, bh in boxes:
             if bw < 1 or bh < 2:
                 continue
             d = self._recognize_digit(thresh[by:by+bh, bx:bx+bw])
             digits.append(str(d))
+            box_info.append(f"{d}({bw}x{bh})")
 
         number_str = "".join(digits)
         try:
             result = int(number_str)
         except ValueError:
             result = -1
-        self._log(f"[Potion] OCR: '{number_str}' = {result}")
+        self._log(f"[Potion] OCR: '{number_str}' = {result} "
+                  f"[{len(boxes)} boxes: {', '.join(box_info)}] "
+                  f"crop={num_x2-num_x1}x{num_y2-num_y1}px")
         return result
 
     # 5x7 reference bitmaps for digits 0-9 (1=white, 0=black)
