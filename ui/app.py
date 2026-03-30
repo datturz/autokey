@@ -2636,20 +2636,9 @@ class L2MAutoKeyApp:
         arr = np.array(crop)
 
         # Use MAX channel — catches red/yellow/white text
-        # Start with high threshold (200) for clean digits.
-        # Only lower threshold if too FEW valid digit boxes found.
-        # NEVER use threshold < 180 — it merges digits into blobs.
+        # Threshold at 200 for clean digit separation.
         max_channel = np.max(arr, axis=2)
         _, thresh = cv2.threshold(max_channel, 200, 255, cv2.THRESH_BINARY)
-
-        # Check if we got enough digit contours
-        test_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        test_boxes = [cv2.boundingRect(c) for c in test_contours]
-        test_boxes = [(x, y, bw, bh) for x, y, bw, bh in test_boxes
-                      if bh > thresh.shape[0] * 0.20 and bw >= 1]
-        if len(test_boxes) < 2:
-            # Too few digits — icon may be dimmed, try 180 (not lower!)
-            _, thresh = cv2.threshold(max_channel, 180, 255, cv2.THRESH_BINARY)
 
         # Debug: save first 10 times (persistent dir, survives exe restart)
         if not hasattr(self, '_potion_debug_count'):
@@ -2720,6 +2709,15 @@ class L2MAutoKeyApp:
             digits.append(str(d))
             box_info.append(f"{d}({bw}x{bh})")
 
+        # Check for missing leading "1": if first digit box starts at x>8
+        # AND first recognized digit is not already "1", a dim "1" was likely missed.
+        if (boxes and boxes[0][0] > 8 and len(digits) >= 2
+                and digits[0] != '1'):
+            gap = max_channel[:, :boxes[0][0]]
+            if np.max(gap) > 150:
+                digits.insert(0, '1')
+                box_info.insert(0, '1(dim)')
+
         number_str = "".join(digits)
         try:
             result = int(number_str)
@@ -2755,34 +2753,49 @@ class L2MAutoKeyApp:
         return result
 
     # 5x7 reference bitmaps for digits 0-9 (1=white, 0=black)
+    # Multiple variants per digit for better matching across fonts
     _DIGIT_REFS = None
 
     @classmethod
     def _get_digit_refs(cls):
         if cls._DIGIT_REFS is not None:
             return cls._DIGIT_REFS
-        raw = {
-            0: ["01110","10001","10001","10001","10001","10001","01110"],
-            1: ["00100","01100","00100","00100","00100","00100","01110"],
-            2: ["01110","10001","00001","00110","01000","10000","11111"],
-            3: ["01110","10001","00001","00110","00001","10001","01110"],
-            4: ["00110","01010","10010","11111","00010","00010","00010"],
-            5: ["11111","10000","11110","00001","00001","10001","01110"],
-            6: ["00110","01000","10000","11110","10001","10001","01110"],
-            7: ["11111","00001","00010","00100","01000","01000","01000"],
-            8: ["01110","10001","10001","01110","10001","10001","01110"],
-            9: ["01110","10001","10001","01111","00001","00010","01100"],
+        # Standard font + L2M game font variants
+        # Each digit can have multiple reference bitmaps
+        variants = {
+            0: [["01110","10001","10001","10001","10001","10001","01110"],
+                ["01110","11011","10001","10001","10001","11011","01110"],
+                ["01110","10001","10011","10001","11001","10001","01110"]],
+            1: [["00100","01100","00100","00100","00100","00100","01110"],
+                ["00010","01110","00010","00010","00010","00010","00010"],
+                ["00011","11011","00001","00001","00001","00001","00011"]],
+            2: [["01110","10001","00001","00110","01000","10000","11111"],
+                ["01110","10011","00001","00110","01110","11100","11111"]],
+            3: [["01110","10001","00001","00110","00001","10001","01110"],
+                ["01110","00011","00011","00110","00001","10011","01110"]],
+            4: [["00110","01010","10010","11111","00010","00010","00010"],
+                ["00110","00110","01100","10000","11111","00111","00000"]],
+            5: [["11111","10000","11110","00001","00001","10001","01110"]],
+            6: [["00110","01000","10000","11110","10001","10001","01110"]],
+            7: [["11111","00001","00010","00100","01000","01000","01000"]],
+            8: [["01110","10001","10001","01110","10001","10001","01110"],
+                ["01110","10011","11011","01110","10001","10001","01110"]],
+            9: [["01110","10001","10001","01111","00001","00010","01100"],
+                ["01110","10001","10001","01111","00001","00001","01110"]],
         }
         cls._DIGIT_REFS = {}
-        for d, rows in raw.items():
-            bitmap = np.array([[int(c) for c in row] for row in rows], dtype=np.float32)
-            cls._DIGIT_REFS[d] = bitmap
+        for d, var_list in variants.items():
+            bitmaps = []
+            for rows in var_list:
+                bitmap = np.array([[int(c) for c in row] for row in rows], dtype=np.float32)
+                bitmaps.append(bitmap)
+            cls._DIGIT_REFS[d] = bitmaps
         return cls._DIGIT_REFS
 
     @classmethod
     def _recognize_digit(cls, digit_img) -> int:
-        """Recognize a digit by resizing to 5x7 and correlating with references.
-        Enhanced: multi-resolution matching (5x7 + 7x10) for better accuracy."""
+        """Recognize a digit using quadrant fill analysis + bitmap correlation.
+        Two-stage: feature filter narrows candidates, then bitmap picks winner."""
         h, w = digit_img.shape
         if h < 2 or w < 1:
             return 0
@@ -2791,25 +2804,48 @@ class L2MAutoKeyApp:
         if w / h < 0.45:
             return 1
 
-        # Very wide and short = likely noise/artifact, skip
+        # Very wide and short = noise
         if w / h > 2.0:
             return 0
 
-        # Primary: resize to 5x7, normalize to 0-1
+        # Stage 1: Compute quadrant fill features
+        total = np.sum(digit_img > 0)
+        area = h * w
+        fill = total / area if area > 0 else 0
+        mh, mw = h // 2, w // 2
+        tl = np.sum(digit_img[:mh, :mw] > 0) / max(1, mh * mw)
+        tr = np.sum(digit_img[:mh, mw:] > 0) / max(1, mh * (w - mw))
+        bl = np.sum(digit_img[mh:, :mw] > 0) / max(1, (h - mh) * mw)
+        br = np.sum(digit_img[mh:, mw:] > 0) / max(1, (h - mh) * (w - mw))
+        ch = h // 3
+        center = np.sum(digit_img[ch:2*ch, :] > 0) / max(1, ch * w)
+
+        # Feature-based quick decisions for commonly confused digits
+        if br < 0.20 and tr > 0.50:
+            return 7  # 7: empty bottom-right, filled top-right
+        if bl < 0.15 and tl > 0.50:
+            return 9  # 9: empty bottom-left, filled top-left
+        if fill > 0.52 and center > 0.45:
+            return 8  # 8: highest fill and center density
+        if bl > 0.50 and tr > 0.50 and center < 0.35:
+            return 0  # 0: ring shape, low center
+        if bl > 0.55 and tl < 0.35:
+            return 2  # 2: heavy bottom-left, light top-left
+        if tl > 0.45 and bl > 0.45 and center > 0.55:
+            return 6  # 6: filled left side + center
+
+        # Stage 2: Bitmap correlation for remaining cases
         resized = cv2.resize(digit_img, (5, 7), interpolation=cv2.INTER_AREA)
         norm = resized.astype(np.float32) / 255.0
 
-        # Compare against each reference bitmap
         refs = cls._get_digit_refs()
         best_d, best_score = 0, -999
-        scores = {}
-        for d, ref in refs.items():
-            # Correlation: sum of element-wise product minus non-matching
-            score = np.sum(norm * ref) - np.sum(norm * (1 - ref)) * 0.5
-            scores[d] = score
-            if score > best_score:
-                best_score = score
-                best_d = d
+        for d, bitmaps in refs.items():
+            for ref in bitmaps:
+                score = np.sum(norm * ref) - np.sum(norm * (1 - ref)) * 0.5
+                if score > best_score:
+                    best_score = score
+                    best_d = d
 
         return best_d
 
