@@ -1945,63 +1945,81 @@ class L2MAutoKeyApp:
     def _is_boss_target_bar_visible(self, img, debug: bool = False) -> bool:
         """Cek apakah boss target bar ada di frame.
 
-        Boss bar = garis merah horizontal + nama boss di PALING ATAS layar (y 0-5%).
-        Detect via template matching di region top strip (0-5% height, 40-100% width).
-        Hindari HP bar player (0-30% width).
+        Boss bar = garis merah horizontal + nama boss di PALING ATAS layar.
+        Two methods:
+        1. Template matching (primary)
+        2. Red HP bar color detection in top strip (fallback)
         """
-        if not self._boss_target_bar_tpls:
-            return False
         w, h = img.size
-        # Region: PALING ATAS layar, kanan dari HP bar player
-        rx1 = int(w * 0.40)
+        # Region: top 8% of screen, right of player HP bar (40-100% width)
+        rx1 = int(w * 0.35)
         ry1 = 0
         rx2 = w
-        ry2 = int(h * 0.06)
+        ry2 = int(h * 0.08)
 
         crop = img.crop((rx1, ry1, rx2, ry2))
         crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
         ch, cw = crop_bgr.shape[:2]
         scale = h / 720.0
 
-        for tpl_bgr, tpl_mask, fname in self._boss_target_bar_tpls:
-            th, tw = tpl_bgr.shape[:2]
-            s_tpl = tpl_bgr
-            s_mask = tpl_mask
-            if abs(scale - 1.0) > 0.05:
-                new_w = max(1, int(tw * scale))
-                new_h = max(1, int(th * scale))
-                if new_w < cw and new_h < ch:
-                    s_tpl = cv2.resize(tpl_bgr, (new_w, new_h))
-                    s_mask = cv2.resize(tpl_mask, (new_w, new_h)) if tpl_mask is not None else None
+        # Method 1: Template matching
+        if self._boss_target_bar_tpls:
+            for tpl_bgr, tpl_mask, fname in self._boss_target_bar_tpls:
+                th, tw = tpl_bgr.shape[:2]
+                s_tpl = tpl_bgr
+                s_mask = tpl_mask
+                if abs(scale - 1.0) > 0.05:
+                    new_w = max(1, int(tw * scale))
+                    new_h = max(1, int(th * scale))
+                    if new_w < cw and new_h < ch:
+                        s_tpl = cv2.resize(tpl_bgr, (new_w, new_h))
+                        s_mask = cv2.resize(tpl_mask, (new_w, new_h)) if tpl_mask is not None else None
 
-            sth, stw = s_tpl.shape[:2]
-            if sth > ch or stw > cw:
-                continue
+                sth, stw = s_tpl.shape[:2]
+                if sth > ch or stw > cw:
+                    continue
 
-            if s_mask is not None:
-                result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
-            else:
-                result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(result)
+                if s_mask is not None:
+                    result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+                else:
+                    result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
 
-            if debug:
-                print(f"[TargetBar] {fname}: score={max_val:.3f} (top 0-6%, right 40-100%)")
+                if debug:
+                    print(f"[TargetBar] {fname}: score={max_val:.3f}")
 
-            if max_val >= 0.65:
-                return True
+                if max_val >= 0.60:
+                    return True
+
+        # Method 2: Fallback — detect red HP bar via HSV color
+        # Boss target bar is a distinct red horizontal bar
+        crop_hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        # Red hue: 0-10 or 170-180, high saturation, medium+ value
+        mask_low = cv2.inRange(crop_hsv, (0, 120, 80), (10, 255, 255))
+        mask_high = cv2.inRange(crop_hsv, (170, 120, 80), (180, 255, 255))
+        red_mask = cv2.bitwise_or(mask_low, mask_high)
+        red_pixels = np.count_nonzero(red_mask)
+        red_ratio = red_pixels / (ch * cw) if ch * cw > 0 else 0
+
+        if debug:
+            print(f"[TargetBar] Red fallback: {red_pixels}px ratio={red_ratio:.3f}")
+
+        # Boss bar typically fills >2% of the top strip with red
+        if red_ratio > 0.02:
+            return True
+
         return False
 
     def _wait_boss_dead_then_tp(self, settings: dict, label: str = "Boss"):
-        """Tunggu boss/zariche mati, loot, TP ke farm. Satu loop simpel.
+        """Tunggu boss/zariche mati, loot, TP ke farm.
 
-        Setelah TP ke lokasi boss:
+        Enhanced precision:
         1. Loading 5s
-        2. Spam radar + cek frame setiap 3s:
-           - target_bar BELUM muncul → terus spam radar, tunggu
-           - target_bar MUNCUL → tekan hit key, mulai fighting
-           - target_bar HILANG (setelah pernah muncul) → boss mati! loot 25s
-           - TIMEOUT → TP ke farm
-        3. TP ke farm
+        2. Spam radar continuously (every 3s, even during fight)
+        3. Multi-hit: press hit key repeatedly until boss engaged
+        4. Faster death detection: 3x bar gone (9s) instead of 5x (15s)
+        5. Adaptive loot wait: 15s base, check if target bar reappears
+        6. Auto re-engage if boss bar comes back (wasn't dead)
         """
         if not self.capturer:
             return
@@ -2018,70 +2036,101 @@ class L2MAutoKeyApp:
         if self.stop_event.is_set():
             return
 
-        # Map sudah tertutup → unblock combat escape agar bisa trigger saat HP drop
+        # Map closed → unblock combat escape
         self.isBlockedByMouseAction = False
 
         self._log(f"[{label}] Monitoring boss bar (max {tele_wait_min}m)...")
         start = time.time()
         last_radar_press = 0.0
+        last_hit_press = 0.0
         boss_spawned = False
-        hit_sent = False
-        gone_count = 0  # Berapa kali bar hilang berturut-turut setelah spawn
+        boss_engaged = False  # True after we confirmed hitting boss
+        gone_count = 0
+        hit_count = 0
 
         while not self.stop_event.is_set():
             elapsed = time.time() - start
+            now = time.time()
+
             if elapsed > max_wait:
-                self._log(f"[{label}] Timeout {tele_wait_min}m → TP ke farm")
+                self._log(f"[{label}] Timeout {tele_wait_min}m -> TP ke farm")
                 break
 
-            # Spam radar setiap 5s (selama boss belum spawn)
-            if not boss_spawned and radar_key and self.key_sender:
-                if (time.time() - last_radar_press) > 5:
-                    self.key_sender.send(radar_key)
-                    last_radar_press = time.time()
+            # Spam radar continuously (every 3s) — boss may move/respawn
+            if radar_key and self.key_sender and (now - last_radar_press) > 3:
+                self.key_sender.send(radar_key)
+                last_radar_press = now
 
             img = self.capturer.capture()
             if img is None:
-                self.stop_event.wait(2)
+                self.stop_event.wait(1)
                 continue
 
-            debug = (int(elapsed) % 10 == 0 and elapsed > 1)
+            debug = (int(elapsed) % 15 == 0 and elapsed > 1)
             bar_visible = self._is_boss_target_bar_visible(img, debug=debug)
 
             if bar_visible and not boss_spawned:
-                # Boss bar MUNCUL → boss spawn! Hit!
+                # Boss bar APPEARS -> boss spawned!
                 boss_spawned = True
                 gone_count = 0
-                self._log(f"[{label}] BOSS SPAWN! Bar terdeteksi!")
+                self._log(f"[{label}] BOSS SPAWN! Bar detected!")
+
+                # Immediate radar + hit
                 if radar_key and self.key_sender:
                     self.key_sender.send(radar_key)
-                    time.sleep(0.5)
-                if hit_key and self.key_sender and not hit_sent:
+                    time.sleep(0.3)
+                if hit_key and self.key_sender:
                     self._log(f"[{label}] Hit: {hit_key}")
                     self.key_sender.send(hit_key)
-                    hit_sent = True
+                    last_hit_press = now
+                    hit_count = 1
 
             elif bar_visible and boss_spawned:
-                # Masih fighting
+                # Still fighting — keep hitting every 2s until engaged
                 gone_count = 0
+                if hit_key and self.key_sender and not boss_engaged:
+                    if (now - last_hit_press) > 2.0 and hit_count < 5:
+                        self.key_sender.send(hit_key)
+                        last_hit_press = now
+                        hit_count += 1
+                        self._log(f"[{label}] Re-hit #{hit_count}")
+                    elif hit_count >= 5:
+                        boss_engaged = True
+                        self._log(f"[{label}] Engaged! Fighting...")
+
                 if debug:
                     self._log(f"[{label}] Fighting... ({elapsed:.0f}s)")
 
             elif not bar_visible and boss_spawned:
-                # Bar hilang setelah spawn → boss mati? Verifikasi 5x (15s)
+                # Bar gone after spawn -> boss dead? Verify 3x (faster)
                 gone_count += 1
-                self._log(f"[{label}] Bar hilang? Verifikasi ({gone_count}/5)")
-                if gone_count >= 5:
-                    self._log(f"[{label}] BOSS MATI! Loot 25s...")
-                    self.stop_event.wait(25)
+                if gone_count <= 3:
+                    self._log(f"[{label}] Bar gone? ({gone_count}/3)")
+                if gone_count >= 3:
+                    self._log(f"[{label}] BOSS DEAD! Looting...")
+                    # Adaptive loot: wait 15s, then check if bar reappears
+                    self.stop_event.wait(15)
+                    if self.stop_event.is_set():
+                        return
+                    # Double-check: bar might reappear (boss wasn't dead)
+                    recheck = self.capturer.capture()
+                    if recheck and self._is_boss_target_bar_visible(recheck):
+                        self._log(f"[{label}] Boss NOT dead! Bar came back, re-engaging...")
+                        gone_count = 0
+                        boss_engaged = False
+                        hit_count = 0
+                        continue
+                    # Confirmed dead
+                    self._log(f"[{label}] Confirmed dead. Wait 10s more for loot...")
+                    self.stop_event.wait(10)
                     break
 
             elif not bar_visible and not boss_spawned:
-                # Belum spawn, belum ada bar — log setiap 10s
-                if int(elapsed) % 10 == 0 and elapsed > 1:
+                # Not spawned yet
+                if int(elapsed) % 15 == 0 and elapsed > 1:
                     self._log(f"[{label}] Waiting spawn... ({elapsed:.0f}s/{max_wait}s)")
 
-            self.stop_event.wait(3)
+            self.stop_event.wait(2)  # Check every 2s (was 3s)
 
         if self.stop_event.is_set():
             return
@@ -2263,17 +2312,30 @@ class L2MAutoKeyApp:
                 time.sleep(2)
 
                 # Confirm popup (Use Blessed Teleport Scroll)
-                img2 = self.capturer.capture()
-                if img2:
+                # Retry up to 3 times to find and click confirm
+                for _confirm_try in range(3):
+                    self.stop_event.wait(1)
+                    img2 = self.capturer.capture()
+                    if not img2:
+                        continue
+                    # Try template match first
+                    confirm_pos = self._get_confirm_position(img2)
+                    if confirm_pos:
+                        self._log(f"[{label}] Confirm popup (template) → klik")
+                        self.clicker.click(confirm_pos[0], confirm_pos[1])
+                        time.sleep(2)
+                        break
                     has_popup = self._has_template_in_fullscreen(
                         img2, self._confirm_dialog_tpl, threshold=0.5)
                     if has_popup:
                         self._log(f"[{label}] Confirm popup → klik Confirm")
                         self.clicker.click_scaled(740, 490)
                         time.sleep(2)
+                        break
                     elif self._need_confirm(img2):
                         self.clicker.click_scaled(740, 490)
                         time.sleep(2)
+                        break
 
                 self._log(f"[{label}] Teleported ke {area}! {time.strftime('%H:%M:%S')}")
                 self.root.after(0, status_label.config,
