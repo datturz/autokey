@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore", message="Palette images with Transparency")
 from core.screen_capture import WindowCapturer
 from core.key_sender import KeySender, KEY_LIST
 from core.mouse_clicker import MouseClicker
-from core.hp_checker import HPChecker, hp_color
+from core.hp_checker import HPChecker, hp_color, mp_color
 from core.image_utils import load_image, match_template
 from core.hunting import HuntingChecker
 try:
@@ -784,6 +784,12 @@ class L2MAutoKeyApp:
                     hp_float = self.hp_checker.get_hp_percentage(img)
                     hp_drop = self.last_hp_pct - hp_float
 
+                    # Read MP too (every frame, low cost)
+                    try:
+                        mp_float = self.hp_checker.get_mp_percentage(img)
+                    except Exception:
+                        mp_float = -1.0
+
                     # Guard: HP sudden drop > 30% dalam 1 frame = capture error
                     # (alt-tab, minimize, frame corrupted)
                     # HP real tidak mungkin drop >30% dalam 0.3 detik
@@ -794,7 +800,7 @@ class L2MAutoKeyApp:
                     else:
                         hp_pct = int(hp_float * 100)
                         self.last_hp_pct = hp_float
-                        self.root.after(0, self._update_hp_display, hp_float)
+                        self.root.after(0, self._update_hp_display, hp_float, mp_float)
                 except Exception:
                     hp_pct = int(self.last_hp_pct * 100)
 
@@ -881,9 +887,17 @@ class L2MAutoKeyApp:
                 traceback.print_exc()
                 self.stop_event.wait(1)
 
-    def _update_hp_display(self, pct: float):
+    def _update_hp_display(self, pct: float, mp_pct: float = -1.0):
         color = hp_color(pct)
-        self.hp_label.config(text=f"HP: {pct*100:.0f}%", foreground=color)
+        rate = self.hp_checker.hp_rate
+        # Only show rate if it's reasonable (< 50%/s) and significant
+        rate_str = ""
+        if 0.05 < abs(rate) < 0.50:
+            rate_str = f" ({rate*100:+.0f}%/s)"
+        hp_text = f"HP: {pct*100:.0f}%{rate_str}"
+        if 0.0 < mp_pct <= 1.0:
+            hp_text += f"  MP: {mp_pct*100:.0f}%"
+        self.hp_label.config(text=hp_text, foreground=color)
 
     # ──────────────────────────────────────────────
     #  Combat Escape (weapon → skill → teleport)
@@ -1016,15 +1030,30 @@ class L2MAutoKeyApp:
     # ──────────────────────────────────────────────
 
     def _check_hp_actions(self, hp_pct: float):
-        """HP-based key presses with cooldown (like original)."""
+        """HP-based key presses with cooldown (like original).
+        Enhanced: emergency burst healing when HP drops fast."""
         settings = self.tab_main.collect_settings()
         now = time.time()
+
+        # Emergency burst: HP dropping fast (>15%/sec) → spam low HP key rapidly
+        if (settings.get("enable_low_hp") and self.key_sender
+                and self.hp_checker.is_hp_dropping_fast(-0.15)):
+            key = settings.get("low_hp_key", "")
+            if key and now - getattr(self, '_hp_burst_last', 0) > 0.3:
+                self._send_key_safe(key)
+                self._hp_burst_last = now
+                if now - getattr(self, '_hp_burst_log', 0) > 3.0:
+                    self._log(f"HP dropping fast! ({self.hp_checker.hp_rate*100:.0f}%/s) burst {key}")
+                    self._hp_burst_log = now
+                return  # Skip normal checks during burst
 
         # Low HP action (press heal key)
         if settings.get("enable_low_hp") and self.key_sender:
             threshold = settings.get("low_hp_percent", 30) / 100.0
             if hp_pct < threshold:
-                if now - getattr(self, '_hp_low_last', 0) > 1.0:
+                # Faster cooldown when HP is very low (<15%)
+                cooldown = 0.5 if hp_pct < 0.15 else 1.0
+                if now - getattr(self, '_hp_low_last', 0) > cooldown:
                     key = settings.get("low_hp_key", "")
                     if key:
                         self._send_key_safe(key)
@@ -2547,7 +2576,7 @@ class L2MAutoKeyApp:
         result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-        if max_val >= 0.60:
+        if max_val >= 0.70:
             # Return match top-left + template size (full template with mask)
             match_x = search_x1 + max_loc[0]
             match_y = search_y + max_loc[1]
@@ -2607,19 +2636,20 @@ class L2MAutoKeyApp:
         arr = np.array(crop)
 
         # Use MAX channel — catches red/yellow/white text
-        # Try threshold 200 first; if too few digits found, retry with 170
-        # (lower threshold needed when potion icon is dimmed during auto-use animation)
+        # Start with high threshold (200) for clean digits.
+        # Only lower threshold if too FEW valid digit boxes found.
+        # NEVER use threshold < 180 — it merges digits into blobs.
         max_channel = np.max(arr, axis=2)
         _, thresh = cv2.threshold(max_channel, 200, 255, cv2.THRESH_BINARY)
 
-        # Check if we got enough contours; if not, retry with lower threshold
+        # Check if we got enough digit contours
         test_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         test_boxes = [cv2.boundingRect(c) for c in test_contours]
         test_boxes = [(x, y, bw, bh) for x, y, bw, bh in test_boxes
                       if bh > thresh.shape[0] * 0.20 and bw >= 1]
         if len(test_boxes) < 2:
-            # Too few digits — icon may be dimmed, use lower threshold
-            _, thresh = cv2.threshold(max_channel, 170, 255, cv2.THRESH_BINARY)
+            # Too few digits — icon may be dimmed, try 180 (not lower!)
+            _, thresh = cv2.threshold(max_channel, 180, 255, cv2.THRESH_BINARY)
 
         # Debug: save first 10 times (persistent dir, survives exe restart)
         if not hasattr(self, '_potion_debug_count'):
@@ -2657,14 +2687,34 @@ class L2MAutoKeyApp:
                 boxes.append((bx, by, bw, bh))
         boxes.sort(key=lambda b: b[0])
 
+        # Merge overlapping/adjacent boxes (same digit split into 2 contours)
+        merged = []
+        for box in boxes:
+            if merged and box[0] < merged[-1][0] + merged[-1][2] + 1:
+                # Overlaps or adjacent to previous — merge
+                px, py, pw, ph = merged[-1]
+                nx = min(px, box[0])
+                ny = min(py, box[1])
+                nx2 = max(px + pw, box[0] + box[2])
+                ny2 = max(py + ph, box[1] + box[3])
+                merged[-1] = (nx, ny, nx2 - nx, ny2 - ny)
+            else:
+                merged.append(box)
+        boxes = merged
+
         if not boxes:
             return -1
 
         # OCR each digit using bitmap template matching
+        # Skip boxes at x=0..2 (left edge phantom from icon border)
         digits = []
         box_info = []
         for bx, by, bw, bh in boxes:
             if bw < 1 or bh < 2:
+                continue
+            if bx < 3 and bw < crop_w * 0.25:
+                # Left edge artifact — skip
+                box_info.append(f"SKIP({bw}x{bh}@x{bx})")
                 continue
             d = self._recognize_digit(thresh[by:by+bh, bx:bx+bw])
             digits.append(str(d))
@@ -2676,14 +2726,28 @@ class L2MAutoKeyApp:
         except ValueError:
             result = -1
 
-        # Sanity check: potion max ~2000, if result > 3000 likely phantom digit
-        # Strip first digit (usually phantom "5" from icon edge)
-        if result > 3000 and len(digits) > 1:
+        # Sanity checks for OCR result
+        # Max potion stack in L2M SEA is ~2000
+        if result > 5000 and len(digits) > 1:
+            # Likely phantom digit from icon edge — try stripping first digit
             stripped = "".join(digits[1:])
             stripped_val = int(stripped) if stripped else -1
-            self._log(f"[Potion] OCR: '{number_str}'→stripped '{stripped}' = {stripped_val} "
-                      f"(phantom fix) [{len(boxes)} boxes: {', '.join(box_info)}]")
-            return stripped_val
+            if 0 < stripped_val <= 2500:
+                self._log(f"[Potion] OCR: '{number_str}'->'{stripped}' = {stripped_val} "
+                          f"(phantom fix) [{len(boxes)} boxes: {', '.join(box_info)}]")
+                return stripped_val
+            # Try stripping last digit too
+            stripped2 = "".join(digits[:-1])
+            stripped2_val = int(stripped2) if stripped2 else -1
+            if 0 < stripped2_val <= 2500:
+                self._log(f"[Potion] OCR: '{number_str}'->'{stripped2}' = {stripped2_val} "
+                          f"(tail phantom fix)")
+                return stripped2_val
+
+        # If result is 0 but we found boxes — OCR failed, return -1 to retry
+        if result == 0 and len(boxes) >= 2:
+            self._log(f"[Potion] OCR got 0 but {len(boxes)} boxes found — unreliable, retry")
+            return -1
 
         self._log(f"[Potion] OCR: '{number_str}' = {result} "
                   f"[{len(boxes)} boxes: {', '.join(box_info)}] "
@@ -2717,7 +2781,8 @@ class L2MAutoKeyApp:
 
     @classmethod
     def _recognize_digit(cls, digit_img) -> int:
-        """Recognize a digit by resizing to 5x7 and correlating with references."""
+        """Recognize a digit by resizing to 5x7 and correlating with references.
+        Enhanced: multi-resolution matching (5x7 + 7x10) for better accuracy."""
         h, w = digit_img.shape
         if h < 2 or w < 1:
             return 0
@@ -2726,16 +2791,22 @@ class L2MAutoKeyApp:
         if w / h < 0.45:
             return 1
 
-        # Resize to 5x7, normalize to 0-1
+        # Very wide and short = likely noise/artifact, skip
+        if w / h > 2.0:
+            return 0
+
+        # Primary: resize to 5x7, normalize to 0-1
         resized = cv2.resize(digit_img, (5, 7), interpolation=cv2.INTER_AREA)
         norm = resized.astype(np.float32) / 255.0
 
         # Compare against each reference bitmap
         refs = cls._get_digit_refs()
         best_d, best_score = 0, -999
+        scores = {}
         for d, ref in refs.items():
             # Correlation: sum of element-wise product minus non-matching
             score = np.sum(norm * ref) - np.sum(norm * (1 - ref)) * 0.5
+            scores[d] = score
             if score > best_score:
                 best_score = score
                 best_d = d
