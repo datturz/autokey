@@ -3031,20 +3031,16 @@ class L2MAutoKeyApp:
         if not self.capturer or not self.key_sender or not self.clicker:
             return
 
+        # Skip if another feature is active (combat escape, boss check, etc.)
+        if self._is_feature_busy():
+            return
+
         # Interval check
         interval_sec = settings.get("potion_check_interval", 5) * 60
         last_check = getattr(self, '_potion_last_check', 0)
         if (now - last_check) < interval_sec:
             return
         self._potion_last_check = now
-
-        # Bring game to foreground before capturing potion count
-        # This ensures we capture the game, not VS Code or other windows
-        try:
-            self.capturer.force_set_foreground()
-            time.sleep(0.3)
-        except Exception:
-            pass
 
         # Read potion count — capture fresh image
         img = self.capturer.capture()
@@ -3123,6 +3119,11 @@ class L2MAutoKeyApp:
         7. TP back to farm
         """
         if not self.capturer or not self.key_sender or not self.clicker:
+            return
+
+        # Acquire feature lock — blocks weapon switch, boss check, etc.
+        if not self._acquire_feature("auto_buy_potion", timeout=3.0):
+            self._log(f"[Potion] Cannot start buy — {self._feature_active} running")
             return
 
         # Block ALL other features during entire buy flow
@@ -3255,12 +3256,12 @@ class L2MAutoKeyApp:
 
         finally:
             self.isBlockedByMouseAction = False
+            self._release_feature()
 
         # Setelah beli selesai, set town state
-        # Biarkan feature "teleport setelah di kota" yang handle TP back ke farm
         self.is_in_town = True
         self.last_in_town_time = time.time()
-        self._escaped_to_town_at = time.time()  # Trigger 1 (escape-based TP back)
+        self._escaped_to_town_at = time.time()
         self.do_auto_hunt = True
         self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
 
