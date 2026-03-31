@@ -975,12 +975,14 @@ class L2MAutoKeyApp:
         # === PHASE 3: Skill activation (only if not cooldown) ===
         if skill_key and skill_ready and self.capturer:
             self._log(f"[CE] Skill: {skill_key}")
+            # Press skill 2x: first opens SELF popup, second confirms
             self.key_sender.send(skill_key)
             time.sleep(0.3)
             self.key_sender.send(skill_key)
 
-            # Quick monitor: max 2s (was 5s) — speed is critical
+            # Wait for skill to activate (max 2s)
             start_mon = time.time()
+            detected_active = False
             while (time.time() - start_mon) < 2.0:
                 time.sleep(0.15)
                 check_img = self.capturer.capture()
@@ -988,15 +990,23 @@ class L2MAutoKeyApp:
                     continue
                 state = self._get_skill_state_by_template(check_img)
                 if state == "active":
-                    self._log("[CE] Active → cancel + TP!")
-                    self.key_sender.send(skill_key)
-                    time.sleep(0.2)
+                    detected_active = True
+                    self._log("[CE] Skill active detected!")
                     break
                 if state == "cooldown":
-                    self._log("[CE] Cooldown → TP!")
+                    self._log("[CE] Cooldown detected → TP!")
                     break
-            else:
-                self._log("[CE] Skill timeout → TP")
+
+            if not detected_active:
+                self._log("[CE] Skill timeout (not detected as active)")
+
+            # ALWAYS cancel skill before teleport — press skill key again
+            # This ensures skill is OFF so teleport works immediately
+            # Even if template didn't detect "active", the skill might be active
+            self._log(f"[CE] Cancel skill: {skill_key}")
+            self.key_sender.send(skill_key)
+            time.sleep(0.2)
+
         elif not skill_ready and weapon_key and not skill_key:
             # No skill configured, just switch weapon
             self._log(f"[CE] Weapon only: {weapon_key}")
