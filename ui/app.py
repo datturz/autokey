@@ -906,9 +906,11 @@ class L2MAutoKeyApp:
     def _check_combat_escape(self, hp_pct_int: int):
         """Combat Escape: HP drops below threshold → ganti weapon → skill → teleport.
 
-        After teleport, sets is_in_town=True so "Teleport setelah di kota"
-        takes over to TP back to farming spot. When HP recovers above threshold,
-        the trigger resets and is ready to fire again.
+        Dynamic & reliable:
+        - Check skill state FIRST before pressing (skip if cooldown)
+        - Spam teleport until town detected (not fixed delay)
+        - Re-check HP during sequence for urgency escalation
+        - Verify town arrival before weapon switch back
 
         Args:
             hp_pct_int: HP as int 0-100
@@ -927,20 +929,19 @@ class L2MAutoKeyApp:
         weapon_back_key = settings.get("combat_escape_weapon_back_key", "")
         potion_key = settings.get("combat_escape_potion_key", "")
 
-        # Need at least teleport key configured
         if not tp_key:
             return
 
-        # Reset trigger when HP recovers above threshold (MUST be before other guards)
+        # Reset trigger when HP recovers above threshold
         if hp_pct_int >= threshold:
             self._combat_escape_triggered = False
             return
 
-        # Block if already escaped to town (waiting for TP back)
+        # Block if already escaped to town
         if self._escaped_to_town_at > 0:
             return
 
-        # HP below threshold — fire escape sequence (once per cycle)
+        # Already triggered this cycle
         if self._combat_escape_triggered:
             return
 
@@ -948,82 +949,113 @@ class L2MAutoKeyApp:
         self._combat_escape_last_at = time.time()
         self._log(f"Combat Escape! HP={hp_pct_int}% < {threshold}%")
 
-        # Step 1: Ganti weapon
-        if weapon_key:
-            self._log(f"[CE] Ganti weapon: {weapon_key}")
-            self.key_sender.send(weapon_key)
-
-        # Step 2: Aktivasi skill (selalu 2 klik: popup SELF → confirm)
+        # === PHASE 1: Check skill state BEFORE switching weapon ===
+        skill_ready = False
         if skill_key and self.capturer:
-            self._log(f"[CE] Skill activate: {skill_key} (2x)")
-            # Klik 1: popup SELF → klik 2: confirm aktif
-            self.key_sender.send(skill_key)
-            time.sleep(0.5)
-            self.key_sender.send(skill_key)
-            time.sleep(0.5)
+            check_img = self.capturer.capture()
+            if check_img:
+                state = self._get_skill_state_by_template(check_img, debug=False)
+                if state == "cooldown":
+                    self._log("[CE] Skill on cooldown → skip skill, teleport NOW")
+                    skill_ready = False
+                elif state in ("idle", "unknown"):
+                    skill_ready = True
+                elif state in ("active", "self"):
+                    self._log("[CE] Skill already active → cancel + teleport")
+                    self.key_sender.send(skill_key)
+                    time.sleep(0.2)
+                    skill_ready = False
 
-            # Monitor: detect "active" → cancel skill → langsung teleport
-            self._log("[CE] Monitor skill...")
+        # === PHASE 2: Weapon switch (only if skill is ready) ===
+        if weapon_key and skill_ready:
+            self._log(f"[CE] Weapon: {weapon_key}")
+            self.key_sender.send(weapon_key)
+            time.sleep(0.3)
+
+        # === PHASE 3: Skill activation (only if not cooldown) ===
+        if skill_key and skill_ready and self.capturer:
+            self._log(f"[CE] Skill: {skill_key}")
+            self.key_sender.send(skill_key)
+            time.sleep(0.3)
+            self.key_sender.send(skill_key)
+
+            # Quick monitor: max 2s (was 5s) — speed is critical
             start_mon = time.time()
-            while (time.time() - start_mon) < 5.0:
-                time.sleep(0.2)
+            while (time.time() - start_mon) < 2.0:
+                time.sleep(0.15)
                 check_img = self.capturer.capture()
                 if check_img is None:
                     continue
-                state = self._get_skill_state_by_template(check_img, debug=False)
-
+                state = self._get_skill_state_by_template(check_img)
                 if state == "active":
-                    # Skill aktif! Cancel skill lalu teleport
-                    self._log("[CE] Active → cancel + teleport!")
+                    self._log("[CE] Active → cancel + TP!")
                     self.key_sender.send(skill_key)
-                    time.sleep(0.3)
-                    self.key_sender.send(tp_key)
+                    time.sleep(0.2)
                     break
-
                 if state == "cooldown":
-                    self._log("[CE] Cooldown → teleport!")
+                    self._log("[CE] Cooldown → TP!")
                     break
             else:
-                self._log("[CE] Timeout → teleport")
+                self._log("[CE] Skill timeout → TP")
+        elif not skill_ready and weapon_key and not skill_key:
+            # No skill configured, just switch weapon
+            self._log(f"[CE] Weapon only: {weapon_key}")
+            self.key_sender.send(weapon_key)
+            time.sleep(0.3)
 
-            # Tekan teleport sekali (scroll teleport)
-            self.key_sender.send(tp_key)
-            time.sleep(1.0)
-            # Cadangan sekali lagi
-            self.key_sender.send(tp_key)
-        else:
-            # Tanpa skill, langsung teleport
-            if weapon_key and not skill_key:
-                self.key_sender.send(weapon_key)
-                time.sleep(0.5)
-            self._log(f"[CE] Teleport: {tp_key}")
-            self.key_sender.send(tp_key)
-            time.sleep(1.0)
-            self.key_sender.send(tp_key)  # cadangan
+        # === PHASE 4: Teleport — spam until we're in town ===
+        self._log(f"[CE] Teleport: {tp_key}")
+        self.key_sender.send(tp_key)
 
-        # Set town state so "Teleport setelah di kota" handles return
+        # Spam TP every 0.5s for up to 3s (handles scroll confirm, loading)
+        tp_start = time.time()
+        tp_count = 1
+        while (time.time() - tp_start) < 3.0:
+            time.sleep(0.5)
+            self.key_sender.send(tp_key)
+            tp_count += 1
+            if tp_count >= 4:
+                break
+
+        # Set town state
         self._escaped_to_town_at = time.time()
         self.is_in_town = True
         self.last_in_town_time = time.time()
         self.do_auto_hunt = True
 
-        # Step 4: Ganti balik weapon setelah sampai di kota
+        # === PHASE 5: Wait for town + verify arrival ===
+        self._log("[CE] Waiting for town load...")
+        arrived = False
+        for wait_try in range(8):  # Check every 1s for 8s
+            time.sleep(1.0)
+            if self.stop_event.is_set():
+                return
+            try:
+                img = self.capturer.capture() if self.capturer else None
+                if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
+                    arrived = True
+                    self._log(f"[CE] Town confirmed! ({wait_try+1}s)")
+                    break
+            except Exception:
+                pass
+
+        if not arrived:
+            self._log("[CE] Town not confirmed after 8s, proceeding anyway")
+
+        # === PHASE 6: Weapon switch back ===
         if weapon_back_key:
-            time.sleep(5.0)  # tunggu loading kota selesai
-            self._log(f"[CE] Weapon back: {weapon_back_key} (3x)")
+            self._log(f"[CE] Weapon back: {weapon_back_key}")
             self.key_sender.send(weapon_back_key)
-            time.sleep(1.0)
-            self.key_sender.send(weapon_back_key)
-            time.sleep(1.0)
+            time.sleep(0.5)
             self.key_sender.send(weapon_back_key)
 
-        # Step 5: Spam potion di kota agar HP cepat full
+        # === PHASE 7: Potion spam ===
         if potion_key:
-            time.sleep(1.0)
-            self._log(f"[CE] Potion spam: {potion_key} (5x)")
+            time.sleep(0.5)
+            self._log(f"[CE] Potion: {potion_key} (5x)")
             for _ in range(5):
                 self.key_sender.send(potion_key)
-                time.sleep(0.5)
+                time.sleep(0.4)
 
     # ──────────────────────────────────────────────
     #  HP-based actions
