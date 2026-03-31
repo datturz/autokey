@@ -32,6 +32,7 @@ from core.screen_capture import WindowCapturer
 from core.key_sender import KeySender, KEY_LIST
 from core.mouse_clicker import MouseClicker
 from core.hp_checker import HPChecker, hp_color, mp_color
+from core.boss_timer import BossTimer
 from core.image_utils import load_image, match_template
 from core.hunting import HuntingChecker
 try:
@@ -415,7 +416,10 @@ class L2MAutoKeyApp:
         # Thread 4: Other tasks (teleport, auto hunt, letter, boss, daily)
         self._start_thread(self._other_tasks, "other_tasks")
 
-        # Thread 5: Radar scan
+        # Thread 5: Smart boss hunt (timer-driven)
+        self._start_thread(self._smart_boss_hunt_loop, "smart_boss_hunt")
+
+        # Thread 6: Radar scan
         if settings.get("radar_scan_enabled"):
             self._start_thread(self._radar_scan_loop, "radar_scan")
 
@@ -1510,6 +1514,377 @@ class L2MAutoKeyApp:
             result = cv2.matchTemplate(crop_bgr, scaled_tpl, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(result)
         return max_val > 0.8
+
+    # ──────────────────────────────────────────────
+    #  Smart Boss Hunt (timer-driven)
+    # ──────────────────────────────────────────────
+
+    def _smart_boss_hunt_loop(self):
+        """Smart boss hunt — polls Supabase for upcoming bosses, auto TP + hit.
+
+        Flow:
+        1. Poll boss timer every 30s
+        2. When boss countdown < pre-position time → trigger hunt
+        3. Open map → find boss → find glowing skull → teleport
+        4. Wait + radar spam → boss bar → hit
+        5. Boss dies → screenshot → TP back to farm
+        """
+        boss_timer = BossTimer()
+        hunted_bosses = set()  # Track which bosses we already attempted this cycle
+
+        while not self.stop_event.is_set():
+            self.stop_event.wait(10)  # Poll every 10s
+            if self.stop_event.is_set():
+                break
+
+            settings = self.tab_daily.collect_settings()
+            if not settings.get("smart_boss_enabled"):
+                continue
+
+            # Skip if in town, escaping, or busy
+            if self.is_in_town or self._escaped_to_town_at > 0:
+                continue
+            if self._is_feature_busy():
+                continue
+
+            prepos_min = settings.get("smart_boss_prepos_min", 1)
+            hit_key = settings.get("smart_boss_hit_key", "")
+            radar_key = settings.get("smart_boss_radar_key", "")
+
+            # Which boss types to hunt
+            allowed_types = set()
+            if settings.get("smart_boss_type_ours"): allowed_types.add("ours")
+            if settings.get("smart_boss_type_ffa"): allowed_types.add("ffa")
+            if settings.get("smart_boss_type_inv"): allowed_types.add("invasion")
+
+            if not allowed_types:
+                continue
+
+            # Get upcoming bosses within pre-position window
+            upcoming = boss_timer.get_upcoming_bosses(within_minutes=prepos_min)
+
+            # Filter by type and not already hunted
+            targets = [b for b in upcoming
+                       if b["type"] in allowed_types
+                       and b["name"] not in hunted_bosses]
+
+            if not targets:
+                # Update status with next boss info
+                all_bosses = boss_timer.get_upcoming_bosses(within_minutes=120)
+                filtered = [b for b in all_bosses if b["type"] in allowed_types]
+                if filtered:
+                    nxt = filtered[0]
+                    cd = boss_timer.format_countdown(nxt["countdown_sec"])
+                    self.root.after(0, self.tab_daily.smart_boss_status.config,
+                                    {"text": f"Next: {nxt['name']} in {cd}"})
+                continue
+
+            # Target the nearest boss
+            target = targets[0]
+            boss_name = target["name"]
+            cd = boss_timer.format_countdown(target["countdown_sec"])
+            self._log(f"[SmartBoss] Target: {boss_name} (countdown={cd})")
+            self.root.after(0, self.tab_daily.smart_boss_status.config,
+                            {"text": f"HUNTING: {boss_name} ({cd})"})
+
+            # Acquire feature lock
+            if not self._acquire_feature("smart_boss_hunt", timeout=5.0):
+                self._log(f"[SmartBoss] Cannot start — {self._feature_active} running")
+                continue
+
+            try:
+                success = self._execute_smart_boss_hunt(boss_name, settings)
+                hunted_bosses.add(boss_name)
+                if success:
+                    self._log(f"[SmartBoss] {boss_name} — HIT!")
+                else:
+                    self._log(f"[SmartBoss] {boss_name} — MISS or DEAD")
+
+                # Reset hunted list after 30 min (boss respawn cycle)
+                # So we can re-hunt the same boss next spawn
+            except Exception as e:
+                self._log(f"[SmartBoss] Error: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self._release_feature()
+
+            # Clear hunted bosses after 1 hour
+            if len(hunted_bosses) > 20:
+                hunted_bosses.clear()
+
+    def _execute_smart_boss_hunt(self, boss_name: str, settings: dict) -> bool:
+        """Execute the full boss hunt sequence for one boss.
+
+        Returns True if boss was successfully hit (Participated).
+        """
+        hit_key = settings.get("smart_boss_hit_key", "")
+        radar_key = settings.get("smart_boss_radar_key", "")
+
+        if not self.capturer or not self.key_sender or not self.clicker:
+            return False
+
+        self._load_boss_zariche_templates()
+        self.isBlockedByMouseAction = True
+
+        try:
+            # === STEP 1: Open map, find boss, find glowing skull ===
+            self._log(f"[SmartBoss] Opening map...")
+            self.key_sender.send("M")
+            time.sleep(2)
+
+            img = self.capturer.capture()
+            if img is None:
+                return False
+
+            # Check it's the normal map
+            is_normal = self._has_template_in_fullscreen(img, self._normal_map_tpl, threshold=0.7)
+            if not is_normal:
+                self._log("[SmartBoss] Not normal map")
+                return False
+
+            # Click boss icon in map panel
+            self._log("[SmartBoss] Click boss icon...")
+            self.clicker.click_scaled(MAP_BOSS_ICON_1280[0], MAP_BOSS_ICON_1280[1])
+            time.sleep(2)
+
+            # Find the boss in the area list by name
+            # Try each area to find where this boss is
+            areas = ["ALL", "Gludio", "Dion", "Giran", "Oren", "Aden"]
+            skull_found = False
+
+            for area in areas:
+                if self.stop_event.is_set():
+                    return False
+
+                img = self.capturer.capture()
+                if img is None:
+                    continue
+
+                clicked = self._find_and_click_area(img, area)
+                if not clicked:
+                    continue
+
+                self._log(f"[SmartBoss] Checking area: {area}")
+                time.sleep(2)
+
+                img = self.capturer.capture()
+                if img is None:
+                    continue
+
+                # Check if boss icon is glowing (check_boss.jpg template)
+                has_boss = self._has_template_in_fullscreen(
+                    img, self._boss_template, threshold=0.7)
+                if not has_boss:
+                    continue
+
+                self._log(f"[SmartBoss] Boss found in {area}!")
+
+                # === STEP 2: Find glowing skull on map ===
+                # Template match check_boss.jpg against the map area (center 80%)
+                skull_pos = self._find_glowing_skull(img)
+                if skull_pos:
+                    self._log(f"[SmartBoss] Glowing skull at ({skull_pos[0]},{skull_pos[1]})")
+                    self.clicker.click(skull_pos[0], skull_pos[1])
+                    time.sleep(1)
+
+                    # Click teleport
+                    self.clicker.click_scaled(MAP_BOSS_ENTRY_1280[0], MAP_BOSS_ENTRY_1280[1])
+                    time.sleep(2)
+
+                    # Confirm teleport
+                    img2 = self.capturer.capture()
+                    if img2:
+                        confirm_pos = self._get_confirm_position(img2)
+                        if confirm_pos:
+                            self.clicker.click(confirm_pos[0], confirm_pos[1])
+                        else:
+                            self.clicker.click_scaled(1098, 533)
+                        time.sleep(2)
+
+                        # Confirm popup (scroll)
+                        img3 = self.capturer.capture()
+                        if img3:
+                            has_popup = self._has_template_in_fullscreen(
+                                img3, self._confirm_dialog_tpl, threshold=0.5)
+                            if has_popup or self._need_confirm(img3):
+                                self.clicker.click_scaled(740, 490)
+                                time.sleep(2)
+
+                    skull_found = True
+                    break
+                else:
+                    # No glowing skull found but boss icon lit → click boss entry
+                    self._log("[SmartBoss] No skull found, clicking boss entry...")
+                    self.clicker.click_scaled(MAP_BOSS_ENTRY_1280[0], MAP_BOSS_ENTRY_1280[1])
+                    time.sleep(2)
+
+                    img2 = self.capturer.capture()
+                    if img2:
+                        confirm_pos = self._get_confirm_position(img2)
+                        if confirm_pos:
+                            self.clicker.click(confirm_pos[0], confirm_pos[1])
+                        else:
+                            self.clicker.click_scaled(1098, 533)
+                        time.sleep(2)
+
+                        img3 = self.capturer.capture()
+                        if img3 and (self._has_template_in_fullscreen(
+                                img3, self._confirm_dialog_tpl, threshold=0.5)
+                                or self._need_confirm(img3)):
+                            self.clicker.click_scaled(740, 490)
+                            time.sleep(2)
+
+                    skull_found = True
+                    break
+
+            if not skull_found:
+                self._log(f"[SmartBoss] {boss_name} not found on map")
+                self._close_map()
+                return False
+
+            self._log(f"[SmartBoss] Teleported! Waiting for boss...")
+
+        finally:
+            self.isBlockedByMouseAction = False
+
+        # === STEP 3: Wait for boss + hit ===
+        self._log(f"[SmartBoss] Loading...")
+        self.stop_event.wait(5)
+
+        start = time.time()
+        max_wait = 300  # 5 minutes max
+        boss_appeared = False
+        hit_sent = False
+        hit_count = 0
+        gone_count = 0
+
+        while not self.stop_event.is_set():
+            elapsed = time.time() - start
+            if elapsed > max_wait:
+                self._log(f"[SmartBoss] Timeout 5m")
+                break
+
+            # Radar spam
+            if radar_key and self.key_sender:
+                self.key_sender.send(radar_key)
+
+            img = self.capturer.capture()
+            if img is None:
+                self.stop_event.wait(1)
+                continue
+
+            bar_visible = self._is_boss_target_bar_visible(img)
+
+            if bar_visible and not boss_appeared:
+                boss_appeared = True
+                gone_count = 0
+                self._log(f"[SmartBoss] BOSS BAR! Hitting...")
+                if hit_key and self.key_sender:
+                    self.key_sender.send(hit_key)
+                    hit_count = 1
+
+            elif bar_visible and boss_appeared:
+                gone_count = 0
+                # Keep hitting every 2s
+                if hit_key and self.key_sender and hit_count < 5:
+                    self.key_sender.send(hit_key)
+                    hit_count += 1
+
+            elif not bar_visible and boss_appeared:
+                gone_count += 1
+                if gone_count >= 3:
+                    self._log(f"[SmartBoss] Boss dead! Looting 15s...")
+                    self.stop_event.wait(15)
+                    break
+
+            elif not bar_visible and not boss_appeared:
+                if int(elapsed) % 15 == 0 and elapsed > 1:
+                    self._log(f"[SmartBoss] Waiting... ({elapsed:.0f}s)")
+
+            self.stop_event.wait(2)
+
+        # === STEP 4: Screenshot ===
+        self._log(f"[SmartBoss] Taking screenshot...")
+        try:
+            img = self.capturer.capture()
+            if img:
+                debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         '..', 'debug')
+                os.makedirs(debug_dir, exist_ok=True)
+                ts = time.strftime('%Y%m%d_%H%M%S')
+                path = os.path.join(debug_dir, f'boss_{boss_name}_{ts}.png')
+                img.save(path)
+                self._log(f"[SmartBoss] Screenshot: {path}")
+        except Exception:
+            pass
+
+        # === STEP 5: TP back to farm ===
+        self._log(f"[SmartBoss] TP back to farm...")
+        self._escaped_to_town_at = 0
+        self.is_in_town = False
+        if settings.get("auto_teleport_enabled"):
+            self._teleport_to_spot(settings)
+        self.do_auto_hunt = True
+
+        return boss_appeared
+
+    def _find_glowing_skull(self, img) -> tuple | None:
+        """Find the glowing boss skull icon on the map.
+
+        Uses check_boss.jpg template (red glowing skull).
+        Searches the center 70% of the screen (map area, excluding panels).
+        Returns (x, y) center of match, or None.
+        """
+        tpl_path = os.path.join("assets", "check_boss.jpg")
+        if not os.path.exists(tpl_path):
+            return None
+
+        tpl_data = load_image(tpl_path)
+        if tpl_data is None:
+            return None
+
+        tpl_bgr, tpl_mask = tpl_data
+        w, h = img.size
+
+        # Search center of map (exclude left panel 15%, right panel 15%, top 10%, bottom 10%)
+        rx1 = int(w * 0.15)
+        ry1 = int(h * 0.10)
+        rx2 = int(w * 0.85)
+        ry2 = int(h * 0.90)
+
+        crop = img.crop((rx1, ry1, rx2, ry2))
+        crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+        ch, cw = crop_bgr.shape[:2]
+
+        # Scale template
+        scale = h / 720.0
+        th, tw = tpl_bgr.shape[:2]
+        if abs(scale - 1.0) > 0.05:
+            new_w = max(1, int(tw * scale))
+            new_h = max(1, int(th * scale))
+            if new_w < cw and new_h < ch:
+                tpl_bgr = cv2.resize(tpl_bgr, (new_w, new_h))
+                if tpl_mask is not None:
+                    tpl_mask = cv2.resize(tpl_mask, (new_w, new_h))
+                th, tw = new_h, new_w
+
+        if th > ch or tw > cw:
+            return None
+
+        if tpl_mask is not None:
+            result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCORR_NORMED, mask=tpl_mask)
+        else:
+            result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        self._log(f"[SmartBoss] Skull match: {max_val:.2f}")
+
+        if max_val >= 0.65:
+            cx = rx1 + max_loc[0] + tw // 2
+            cy = ry1 + max_loc[1] + th // 2
+            return (cx, cy)
+        return None
 
     def _radar_scan_loop(self):
         """Radar scan loop — spam radar key, check for alerts, trigger escape."""
