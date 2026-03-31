@@ -977,38 +977,49 @@ class L2MAutoKeyApp:
             self._log(f"[CE] Skill: {skill_key}")
             # Press skill 2x: first opens SELF popup, second confirms
             self.key_sender.send(skill_key)
-            time.sleep(0.3)
+            time.sleep(0.4)
             self.key_sender.send(skill_key)
 
-            # Wait for skill to activate (max 2s)
+            # Wait for skill to activate (max 2.5s)
             start_mon = time.time()
             detected_active = False
-            while (time.time() - start_mon) < 2.0:
-                time.sleep(0.15)
+            while (time.time() - start_mon) < 2.5:
+                time.sleep(0.2)
                 check_img = self.capturer.capture()
                 if check_img is None:
                     continue
                 state = self._get_skill_state_by_template(check_img)
                 if state == "active":
                     detected_active = True
-                    self._log("[CE] Skill active detected!")
+                    self._log("[CE] Skill ACTIVE!")
                     break
                 if state == "cooldown":
-                    self._log("[CE] Cooldown detected → TP!")
+                    self._log("[CE] Cooldown → skip cancel, TP!")
                     break
 
-            if not detected_active:
-                self._log("[CE] Skill timeout (not detected as active)")
-
-            # ALWAYS cancel skill before teleport — press skill key again
-            # This ensures skill is OFF so teleport works immediately
-            # Even if template didn't detect "active", the skill might be active
-            self._log(f"[CE] Cancel skill: {skill_key}")
-            self.key_sender.send(skill_key)
-            time.sleep(0.2)
+            # Cancel skill: press skill key to deactivate
+            # Then wait until skill is actually OFF (cooldown state)
+            if detected_active or state not in ("cooldown",):
+                self._log(f"[CE] Cancel skill: {skill_key}")
+                self.key_sender.send(skill_key)
+                # Wait for skill to go to cooldown (confirms it's off)
+                cancel_start = time.time()
+                while (time.time() - cancel_start) < 2.0:
+                    time.sleep(0.2)
+                    check_img = self.capturer.capture()
+                    if check_img is None:
+                        continue
+                    cstate = self._get_skill_state_by_template(check_img)
+                    if cstate == "cooldown":
+                        self._log("[CE] Skill cancelled (cooldown)!")
+                        break
+                    if cstate in ("idle", "unknown"):
+                        self._log("[CE] Skill off (idle)!")
+                        break
+                else:
+                    self._log("[CE] Cancel timeout, TP anyway")
 
         elif not skill_ready and weapon_key and not skill_key:
-            # No skill configured, just switch weapon
             self._log(f"[CE] Weapon only: {weapon_key}")
             self.key_sender.send(weapon_key)
             time.sleep(0.3)
@@ -1402,9 +1413,14 @@ class L2MAutoKeyApp:
 
             if key2:
                 self.stop_event.wait(delay)
-                if not self.stop_event.is_set():
-                    self._log(f"Ganti senjata kembali: {key2}")
-                    self.key_sender.send(key2)
+                # Re-check: abort key2 if combat escape triggered during delay
+                if self.stop_event.is_set():
+                    break
+                if self._combat_escape_triggered or self._escaped_to_town_at > 0:
+                    self._log(f"Ganti senjata kembali SKIP (combat escape aktif)")
+                    continue
+                self._log(f"Ganti senjata kembali: {key2}")
+                self.key_sender.send(key2)
 
     # ──────────────────────────────────────────────
     #  Radar Scan loop
