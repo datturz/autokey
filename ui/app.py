@@ -2678,6 +2678,13 @@ class L2MAutoKeyApp:
 
         Returns actual number via OCR, or -1 if cannot find/read.
         """
+        # Verify we're capturing the actual game (not VS Code or other window)
+        # by checking the an_hue_icon stability marker
+        if hasattr(self, 'capturer') and self.capturer:
+            if not self.capturer.is_stable_an_hue_icon(img):
+                self._log("[Potion] Screen not game content (stability check failed)")
+                return -1
+
         icon_pos = self._find_potion_icon(img)
         if icon_pos is None:
             return -1
@@ -2933,7 +2940,15 @@ class L2MAutoKeyApp:
             return
         self._potion_last_check = now
 
-        # Read potion count — capture fresh image to avoid stale/obscured screen
+        # Bring game to foreground before capturing potion count
+        # This ensures we capture the game, not VS Code or other windows
+        try:
+            self.capturer.force_set_foreground()
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+        # Read potion count — capture fresh image
         img = self.capturer.capture()
         if img is None:
             return
