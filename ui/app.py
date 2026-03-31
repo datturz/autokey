@@ -379,6 +379,12 @@ class L2MAutoKeyApp:
         self._combat_escape_triggered = False  # Combat escape already fired this cycle
         self._combat_escape_last_at = 0.0  # Timestamp of last combat escape
 
+        # Feature lock — prevents race conditions between features
+        # Only ONE feature can run at a time (weapon switch, boss check, combat escape, etc.)
+        import threading
+        self._feature_lock = threading.Lock()
+        self._feature_active = ""  # Name of currently running feature
+
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.status_label.config(text=self.lang.get("status_active", "Status: Aktif"))
@@ -903,17 +909,36 @@ class L2MAutoKeyApp:
     #  Combat Escape (weapon → skill → teleport)
     # ──────────────────────────────────────────────
 
+    def _acquire_feature(self, name: str, timeout: float = 0.5) -> bool:
+        """Try to acquire the feature lock. Returns True if acquired.
+        If another feature is running, waits up to timeout seconds."""
+        acquired = self._feature_lock.acquire(timeout=timeout)
+        if acquired:
+            self._feature_active = name
+        return acquired
+
+    def _release_feature(self):
+        """Release the feature lock."""
+        self._feature_active = ""
+        try:
+            self._feature_lock.release()
+        except RuntimeError:
+            pass  # Already released
+
+    def _is_feature_busy(self) -> bool:
+        """Check if any feature is currently running."""
+        return self._feature_active != ""
+
     def _check_combat_escape(self, hp_pct_int: int):
-        """Combat Escape: HP drops below threshold → ganti weapon → skill → teleport.
+        """Combat Escape: HP below threshold → skill → cancel → teleport.
 
-        Dynamic & reliable:
-        - Check skill state FIRST before pressing (skip if cooldown)
-        - Spam teleport until town detected (not fixed delay)
-        - Re-check HP during sequence for urgency escalation
-        - Verify town arrival before weapon switch back
+        Completely self-contained per trigger. Re-triggers every time HP is
+        below threshold after returning to farm. No stale state.
 
-        Args:
-            hp_pct_int: HP as int 0-100
+        Flow:
+        A. Skill ready   → weapon → skill 2x → cancel 2x → TP spam
+        B. Skill cooldown → TP spam immediately (no weapon/skill)
+        C. Skill active   → cancel 2x → TP spam
         """
         settings = self.tab_farming.collect_settings()
         if not settings.get("combat_escape_enabled"):
@@ -924,7 +949,6 @@ class L2MAutoKeyApp:
         threshold = settings.get("combat_escape_hp", 50)
         weapon_key = settings.get("combat_escape_weapon_key", "")
         skill_key = settings.get("combat_escape_skill_key", "")
-        skill_slot = settings.get("combat_escape_skill_slot", 4)
         tp_key = settings.get("combat_escape_teleport_key", "")
         weapon_back_key = settings.get("combat_escape_weapon_back_key", "")
         potion_key = settings.get("combat_escape_potion_key", "")
@@ -932,113 +956,92 @@ class L2MAutoKeyApp:
         if not tp_key:
             return
 
-        # Reset trigger when HP recovers above threshold
+        # HP above threshold → reset, not needed
         if hp_pct_int >= threshold:
             self._combat_escape_triggered = False
             return
 
-        # Block if already escaped to town
-        if self._escaped_to_town_at > 0:
+        # Block if in town or escaping
+        if self._escaped_to_town_at > 0 or self.is_in_town:
             return
 
-        # Already triggered this cycle
-        if self._combat_escape_triggered:
+        # Cooldown: don't retrigger within 10s of last escape
+        now = time.time()
+        if (now - getattr(self, '_combat_escape_last_at', 0)) < 10:
+            return
+
+        # Acquire feature lock — wait max 2s (combat escape is high priority)
+        if not self._acquire_feature("combat_escape", timeout=2.0):
+            self._log(f"[CE] Waiting for {self._feature_active} to finish...")
             return
 
         self._combat_escape_triggered = True
-        self._combat_escape_last_at = time.time()
+        self._combat_escape_last_at = now
         self._log(f"Combat Escape! HP={hp_pct_int}% < {threshold}%")
 
-        # === PHASE 1: Check skill state BEFORE switching weapon ===
-        skill_ready = False
+        # === Detect skill state ===
+        skill_state = "unknown"
         if skill_key and self.capturer:
-            check_img = self.capturer.capture()
-            if check_img:
-                state = self._get_skill_state_by_template(check_img, debug=False)
-                if state == "cooldown":
-                    self._log("[CE] Skill on cooldown → skip skill, teleport NOW")
-                    skill_ready = False
-                elif state in ("idle", "unknown"):
-                    skill_ready = True
-                elif state in ("active", "self"):
-                    self._log("[CE] Skill already active → cancel + teleport")
-                    self.key_sender.send(skill_key)
-                    time.sleep(0.2)
-                    skill_ready = False
-
-        # === PHASE 2: Weapon switch (only if skill is ready) ===
-        if weapon_key and skill_ready:
-            self._log(f"[CE] Weapon: {weapon_key}")
-            self.key_sender.send(weapon_key)
-            time.sleep(0.3)
-
-        # === PHASE 3: Skill activation (only if not cooldown) ===
-        if skill_key and skill_ready and self.capturer:
-            self._log(f"[CE] Skill: {skill_key}")
-            # Press skill 2x: first opens SELF popup, second confirms
-            self.key_sender.send(skill_key)
-            time.sleep(0.4)
-            self.key_sender.send(skill_key)
-
-            # Wait for skill to activate (max 2.5s)
-            start_mon = time.time()
-            detected_active = False
-            while (time.time() - start_mon) < 2.5:
-                time.sleep(0.2)
+            try:
                 check_img = self.capturer.capture()
-                if check_img is None:
-                    continue
-                state = self._get_skill_state_by_template(check_img)
-                if state == "active":
-                    detected_active = True
-                    self._log("[CE] Skill ACTIVE!")
-                    break
-                if state == "cooldown":
-                    self._log("[CE] Cooldown → skip cancel, TP!")
-                    break
+                if check_img:
+                    skill_state = self._get_skill_state_by_template(check_img)
+                    self._log(f"[CE] Skill state: {skill_state}")
+            except Exception:
+                pass
 
-            # Cancel skill: press skill key 2x to deactivate
-            # (first press opens cancel popup, second confirms)
-            if detected_active or state not in ("cooldown",):
-                self._log(f"[CE] Cancel skill: {skill_key} (2x)")
+        # === Execute based on skill state ===
+        if skill_state == "cooldown":
+            # Path B: skill on cooldown → teleport immediately, no weapon/skill
+            self._log("[CE] Skill cooldown → TP NOW!")
+
+        elif skill_state in ("active", "self"):
+            # Path C: skill already active → cancel 2x → TP
+            self._log(f"[CE] Skill active → cancel: {skill_key} (2x)")
+            self.key_sender.send(skill_key)
+            time.sleep(0.3)
+            self.key_sender.send(skill_key)
+            time.sleep(0.15)
+
+        else:
+            # Path A: skill idle/unknown → weapon → skill 2x → wait → cancel 2x → TP
+            if weapon_key:
+                self._log(f"[CE] Weapon: {weapon_key}")
+                self.key_sender.send(weapon_key)
+                time.sleep(0.3)
+
+            if skill_key:
+                self._log(f"[CE] Skill activate: {skill_key} (2x)")
+                self.key_sender.send(skill_key)
+                time.sleep(0.4)
+                self.key_sender.send(skill_key)
+
+                # Wait for skill active (max 2s)
+                start_mon = time.time()
+                while (time.time() - start_mon) < 2.0:
+                    time.sleep(0.2)
+                    try:
+                        ci = self.capturer.capture()
+                        if ci:
+                            st = self._get_skill_state_by_template(ci)
+                            if st in ("active", "cooldown"):
+                                self._log(f"[CE] Skill → {st}")
+                                break
+                    except Exception:
+                        pass
+
+                # Cancel skill 2x
+                self._log(f"[CE] Cancel: {skill_key} (2x)")
                 self.key_sender.send(skill_key)
                 time.sleep(0.3)
                 self.key_sender.send(skill_key)
-                # Wait for skill to go to cooldown (confirms it's off)
-                cancel_start = time.time()
-                while (time.time() - cancel_start) < 2.0:
-                    time.sleep(0.2)
-                    check_img = self.capturer.capture()
-                    if check_img is None:
-                        continue
-                    cstate = self._get_skill_state_by_template(check_img)
-                    if cstate == "cooldown":
-                        self._log("[CE] Skill cancelled (cooldown)!")
-                        break
-                    if cstate in ("idle", "unknown"):
-                        self._log("[CE] Skill off (idle)!")
-                        break
-                else:
-                    self._log("[CE] Cancel timeout, TP anyway")
+                time.sleep(0.15)
 
-        elif not skill_ready and weapon_key and not skill_key:
-            self._log(f"[CE] Weapon only: {weapon_key}")
-            self.key_sender.send(weapon_key)
-            time.sleep(0.3)
-
-        # === PHASE 4: Teleport — spam until we're in town ===
-        self._log(f"[CE] Teleport: {tp_key}")
-        self.key_sender.send(tp_key)
-
-        # Spam TP every 0.5s for up to 3s (handles scroll confirm, loading)
-        tp_start = time.time()
-        tp_count = 1
-        while (time.time() - tp_start) < 3.0:
-            time.sleep(0.5)
+        # === TELEPORT — spam immediately, no delay ===
+        self._log(f"[CE] TP: {tp_key} (spam)")
+        for _ in range(5):
             self.key_sender.send(tp_key)
-            tp_count += 1
-            if tp_count >= 4:
-                break
+            time.sleep(0.4)
 
         # Set town state
         self._escaped_to_town_at = time.time()
@@ -1046,10 +1049,10 @@ class L2MAutoKeyApp:
         self.last_in_town_time = time.time()
         self.do_auto_hunt = True
 
-        # === PHASE 5: Wait for town + verify arrival ===
-        self._log("[CE] Waiting for town load...")
+        # === Wait for town arrival ===
+        self._log("[CE] Waiting for town...")
         arrived = False
-        for wait_try in range(8):  # Check every 1s for 8s
+        for wait_try in range(10):
             time.sleep(1.0)
             if self.stop_event.is_set():
                 return
@@ -1057,28 +1060,46 @@ class L2MAutoKeyApp:
                 img = self.capturer.capture() if self.capturer else None
                 if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
                     arrived = True
-                    self._log(f"[CE] Town confirmed! ({wait_try+1}s)")
+                    self._log(f"[CE] Town OK! ({wait_try+1}s)")
                     break
             except Exception:
                 pass
 
         if not arrived:
-            self._log("[CE] Town not confirmed after 8s, proceeding anyway")
+            self._log("[CE] Town not confirmed, wait 3s")
+            time.sleep(3)
 
-        # === PHASE 6: Weapon switch back ===
+        # === Wait screen loaded, then weapon back ===
         if weapon_back_key:
+            self._log("[CE] Wait screen load...")
+            for _lt in range(10):
+                time.sleep(0.5)
+                if self.stop_event.is_set():
+                    return
+                try:
+                    img = self.capturer.capture() if self.capturer else None
+                    if img and self.capturer.is_stable_an_hue_icon(img):
+                        break
+                except Exception:
+                    pass
+            else:
+                time.sleep(1)
+
             self._log(f"[CE] Weapon back: {weapon_back_key}")
             self.key_sender.send(weapon_back_key)
             time.sleep(0.5)
             self.key_sender.send(weapon_back_key)
 
-        # === PHASE 7: Potion spam ===
+        # === Potion spam ===
         if potion_key:
             time.sleep(0.5)
             self._log(f"[CE] Potion: {potion_key} (5x)")
             for _ in range(5):
                 self.key_sender.send(potion_key)
                 time.sleep(0.4)
+
+        # Release feature lock
+        self._release_feature()
 
     # ──────────────────────────────────────────────
     #  HP-based actions
@@ -1395,9 +1416,14 @@ class L2MAutoKeyApp:
                 self.stop_event.wait(1)
                 continue
 
-            # Tunda saat sedang diserang — tunggu sampai aman baru ganti senjata
+            # Tunda saat sedang diserang
             if self.is_attacked:
                 self.stop_event.wait(0.5)
+                continue
+
+            # Acquire feature lock — skip if another feature is running
+            if not self._acquire_feature("weapon_switch", timeout=0.1):
+                self.stop_event.wait(1)
                 continue
 
             last_switch = now
@@ -1417,12 +1443,16 @@ class L2MAutoKeyApp:
                 self.stop_event.wait(delay)
                 # Re-check: abort key2 if combat escape triggered during delay
                 if self.stop_event.is_set():
+                    self._release_feature()
                     break
                 if self._combat_escape_triggered or self._escaped_to_town_at > 0:
                     self._log(f"Ganti senjata kembali SKIP (combat escape aktif)")
+                    self._release_feature()
                     continue
                 self._log(f"Ganti senjata kembali: {key2}")
                 self.key_sender.send(key2)
+
+            self._release_feature()
 
     # ──────────────────────────────────────────────
     #  Radar Scan loop
@@ -2263,10 +2293,16 @@ class L2MAutoKeyApp:
         self._load_boss_zariche_templates()
         now = time.time()
 
+        # Acquire feature lock — skip if another feature is running
+        if not self._acquire_feature(f"check_{kind}", timeout=0.5):
+            self._log(f"[{kind.capitalize()}] Waiting for {self._feature_active}...")
+            return
+
         # Interval check
         last_check = getattr(self, last_check_attr, 0)
         interval_sec = settings.get(interval_key, 5) * 60
         if (now - last_check) < interval_sec:
+            self._release_feature()
             return
 
         setattr(self, last_check_attr, now)
@@ -2420,6 +2456,8 @@ class L2MAutoKeyApp:
                 self._close_map()
             # Unblock combat escape
             self.isBlockedByMouseAction = False
+            # Release feature lock
+            self._release_feature()
 
     # ──────────────────────────────────────────────
     #  Daily tasks (bulk purchase, clan, daily claim)
