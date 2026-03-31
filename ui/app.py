@@ -997,10 +997,12 @@ class L2MAutoKeyApp:
                     self._log("[CE] Cooldown → skip cancel, TP!")
                     break
 
-            # Cancel skill: press skill key to deactivate
-            # Then wait until skill is actually OFF (cooldown state)
+            # Cancel skill: press skill key 2x to deactivate
+            # (first press opens cancel popup, second confirms)
             if detected_active or state not in ("cooldown",):
-                self._log(f"[CE] Cancel skill: {skill_key}")
+                self._log(f"[CE] Cancel skill: {skill_key} (2x)")
+                self.key_sender.send(skill_key)
+                time.sleep(0.3)
                 self.key_sender.send(skill_key)
                 # Wait for skill to go to cooldown (confirms it's off)
                 cancel_start = time.time()
