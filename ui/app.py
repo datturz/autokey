@@ -863,17 +863,18 @@ class L2MAutoKeyApp:
                 except Exception:
                     pass
 
-                # 12. Radar check — HIGHEST PRIORITY, runs even during other features
-                # Only skip if actually in town or just escaped
-                if (not self.is_in_town
-                        and self._escaped_to_town_at == 0
-                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
-                    self._check_radar_actions(img)
-
-                # Combat Escape check (HP below threshold → weapon + skill + teleport)
-                # SKIP saat map terbuka (isBlockedByMouseAction) — key masuk ke map bukan game
+                # 12. Combat Escape FIRST (HP critical = immediate action)
+                # SKIP saat map terbuka (isBlockedByMouseAction)
                 if not self.is_in_town and not self.isBlockedByMouseAction:
                     self._check_combat_escape(hp_pct)
+
+                # 13. Radar check — runs if combat escape didn't trigger
+                # Skip if just escaped (combat or radar) or in town
+                if (not self.is_in_town
+                        and self._escaped_to_town_at == 0
+                        and not self._combat_escape_triggered
+                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
+                    self._check_radar_actions(img)
 
                 # 10. HP-based actions (skip saat map terbuka)
                 if not self.isBlockedByMouseAction:
@@ -1806,14 +1807,22 @@ class L2MAutoKeyApp:
                     self.stop_event.wait(1)
                     continue
 
-                # Skip saat mouse action
+                # Skip saat mouse action or combat escape active
                 if self.isBlockedByMouseAction:
                     self.stop_event.wait(0.5)
                     continue
+                if self._combat_escape_triggered:
+                    self.stop_event.wait(1)
+                    continue
 
-                # Spam radar scan key
+                # Press radar scan key
                 self.key_sender.send(scan_key)
-                time.sleep(0.5)
+                # Wait for radar UI to appear AND settle (avoid matching radar UI itself)
+                time.sleep(1.0)
+
+                # Skip if combat escape triggered during wait
+                if self._combat_escape_triggered or self._escaped_to_town_at > 0:
+                    continue
 
                 # Visual check using warning_1280.png (scaled to current resolution)
                 if self.capturer:
@@ -1932,8 +1941,11 @@ class L2MAutoKeyApp:
                         self.letter_last_time = now
                         self._log("Auto check letter: tekan T")
 
-                # ── Auto Buy Potion ──
-                if not self.is_in_town and self._escaped_to_town_at == 0:
+                # ── Auto Buy Potion (LOWER priority than radar) ──
+                # Skip if radar just triggered or is actively detecting
+                if (not self.is_in_town
+                        and self._escaped_to_town_at == 0
+                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 15):
                     self._check_auto_potion(settings, now)
 
                 # ── Skip boss/zariche/daily saat di kota (escaped) ──
@@ -2970,6 +2982,110 @@ class L2MAutoKeyApp:
     #  Auto Buy Potion
     # ──────────────────────────────────────────────
 
+    def _read_quickslot_potion(self, img) -> int:
+        """Read potion count from quickslot area (large numbers next to icons).
+
+        The quickslot shows items with count like "1374" in white text.
+        Searches bottom 15% of screen, left 55%.
+        Finds potion icon, then reads number to the RIGHT of it.
+        """
+        w, h = img.size
+
+        # Quickslot area: bottom 15%, x: 15-55%
+        qs_y1 = int(h * 0.85)
+        qs_x1 = int(w * 0.15)
+        qs_x2 = int(w * 0.55)
+        qs_crop = img.crop((qs_x1, qs_y1, qs_x2, h))
+        qs_bgr = cv2.cvtColor(np.array(qs_crop), cv2.COLOR_RGB2BGR)
+        qs_h, qs_w = qs_bgr.shape[:2]
+
+        # Find potion icon in quickslot
+        if not hasattr(self, '_potion_icon_tpl') or self._potion_icon_tpl is None:
+            return -1
+
+        tpl_bgr, tpl_mask = self._potion_icon_tpl
+        th, tw = tpl_bgr.shape[:2]
+        scale = h / 720.0
+        if abs(scale - 1.0) > 0.05:
+            nw = max(1, int(tw * scale))
+            nh = max(1, int(th * scale))
+            s_tpl = cv2.resize(tpl_bgr, (nw, nh))
+            s_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
+        else:
+            s_tpl = tpl_bgr
+            s_mask = tpl_mask
+            nw, nh = tw, th
+
+        if nh > qs_h or nw > qs_w:
+            return -1
+
+        result = cv2.matchTemplate(qs_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        if max_val < 0.60:
+            return -1
+
+        # Found icon — number is to the RIGHT of icon
+        icon_right_x = max_loc[0] + nw
+        num_x1 = icon_right_x + 2
+        num_x2 = min(qs_w, icon_right_x + int(nw * 1.5))
+        num_y1 = max_loc[1] + int(nh * 0.3)
+        num_y2 = max_loc[1] + nh
+
+        if num_x2 <= num_x1 or num_y2 <= num_y1:
+            return -1
+
+        num_crop = qs_crop.crop((num_x1, num_y1, num_x2, num_y2))
+        arr = np.array(num_crop)
+        if arr.size == 0:
+            return -1
+
+        # OCR the number — white text on dark background
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        crop_h, crop_w = thresh.shape[:2]
+        boxes = [(x, y, bw, bh) for x, y, bw, bh in
+                 [cv2.boundingRect(c) for c in contours]
+                 if bh > crop_h * 0.25 and bw >= 2]
+        boxes.sort(key=lambda b: b[0])
+
+        if not boxes:
+            return -1
+
+        # Merge overlapping
+        merged = []
+        for box in boxes:
+            if merged and box[0] < merged[-1][0] + merged[-1][2] + 1:
+                px, py, pw, ph = merged[-1]
+                merged[-1] = (min(px, box[0]), min(py, box[1]),
+                              max(px+pw, box[0]+box[2]) - min(px, box[0]),
+                              max(py+ph, box[1]+box[3]) - min(py, box[1]))
+            else:
+                merged.append(box)
+
+        digits = []
+        for bx, by, bw, bh in merged:
+            d, conf = self._recognize_digit_with_confidence(thresh[by:by+bh, bx:bx+bw])
+            if conf < 2.0:
+                return -1  # Low confidence, unreliable
+            digits.append(str(d))
+
+        if not digits:
+            return -1
+
+        self._last_potion_digit_count = len(digits)
+        number_str = "".join(digits)
+        try:
+            result_val = int(number_str)
+        except ValueError:
+            return -1
+
+        self._log(f"[Potion] Quickslot OCR: '{number_str}' = {result_val} "
+                  f"(score={max_val:.2f}, {len(digits)} digits)")
+        return result_val
+
     def _find_potion_icon(self, img):
         """Find potion icon on screen via template matching with potion_icon.png.
 
@@ -3066,28 +3182,33 @@ class L2MAutoKeyApp:
         return None
 
     def _read_potion_count(self, img) -> int:
-        """Find potion icon via template match, then read number below it.
+        """Read potion count from quickslot area (bottom of screen).
 
-        _find_potion_icon returns (match_x, match_y, full_tw, full_th) where
-        match_x/y is top-left of the ICON match, and full_tw/th is the full
-        template size (icon+number). The number is in the bottom ~45% of the
-        full template area.
+        Two methods:
+        1. Find potion icon in quickslot area, read number to the RIGHT
+        2. Fallback: find in hotbar, read number below
 
-        Returns actual number via OCR, or -1 if cannot find/read.
+        Returns number or -1 if cannot read.
         """
         self._last_potion_digit_count = 0
+        w, h = img.size
 
+        # Method 1: Read from quickslot area (larger, clearer numbers)
+        # Quickslot area: bottom 15%, x: 15-55% (left side of skill bar)
+        qs_result = self._read_quickslot_potion(img)
+        if qs_result >= 0:
+            return qs_result
+
+        # Method 2: Fallback to hotbar icon match
         icon_pos = self._find_potion_icon(img)
         if icon_pos is None:
             return -1
 
         match_x, match_y, tw, th = icon_pos
-        w, h = img.size
 
         # Full template = icon (top 60%) + number (bottom 40%)
-        # Crop number area CENTERED under icon, 70% width to exclude edge artifacts
         center_x = match_x + tw // 2
-        half_crop_w = int(tw * 0.35)  # 70% of template width
+        half_crop_w = int(tw * 0.35)
         num_y1 = match_y + int(th * 0.60)
         num_y2 = min(h, match_y + th + 4)
         num_x1 = max(0, center_x - half_crop_w)
@@ -3141,7 +3262,6 @@ class L2MAutoKeyApp:
         merged = []
         for box in boxes:
             if merged and box[0] < merged[-1][0] + merged[-1][2] + 1:
-                # Overlaps or adjacent to previous — merge
                 px, py, pw, ph = merged[-1]
                 nx = min(px, box[0])
                 ny = min(py, box[1])
@@ -3150,25 +3270,43 @@ class L2MAutoKeyApp:
                 merged[-1] = (nx, ny, nx2 - nx, ny2 - ny)
             else:
                 merged.append(box)
-        boxes = merged
+
+        # Split wide boxes (w/h > 1.0 = likely two merged digits)
+        final_boxes = []
+        for bx, by, bw, bh in merged:
+            if bw > 0 and bh > 0 and bw / bh > 1.0 and bw > 10:
+                # Split into two halves
+                half = bw // 2
+                final_boxes.append((bx, by, half, bh))
+                final_boxes.append((bx + half, by, bw - half, bh))
+            else:
+                final_boxes.append((bx, by, bw, bh))
+        boxes = final_boxes
 
         if not boxes:
             return -1
 
-        # OCR each digit using bitmap template matching
+        # OCR each digit with per-digit validation
         # Skip boxes at x=0..2 (left edge phantom from icon border)
         digits = []
         box_info = []
+        digit_confidences = []
         for bx, by, bw, bh in boxes:
             if bw < 1 or bh < 2:
                 continue
             if bx < 3 and bw < crop_w * 0.25:
-                # Left edge artifact — skip
                 box_info.append(f"SKIP({bw}x{bh}@x{bx})")
                 continue
-            d = self._recognize_digit(thresh[by:by+bh, bx:bx+bw])
+            d, confidence = self._recognize_digit_with_confidence(thresh[by:by+bh, bx:bx+bw])
             digits.append(str(d))
-            box_info.append(f"{d}({bw}x{bh})")
+            digit_confidences.append(confidence)
+            box_info.append(f"{d}({bw}x{bh}c={confidence:.1f})")
+
+        # Reject if any digit has very low confidence (< 3.0)
+        if digit_confidences and min(digit_confidences) < 2.0:
+            self._last_potion_digit_count = len(digits)
+            self._log(f"[Potion] Low confidence digit: {', '.join(box_info)} → retry")
+            return -1
 
         # Check for missing leading "1": if first digit box starts at x>8
         # AND first recognized digit is not already "1", a dim "1" was likely missed.
@@ -3284,21 +3422,7 @@ class L2MAutoKeyApp:
         ch = h // 3
         center = np.sum(digit_img[ch:2*ch, :] > 0) / max(1, ch * w)
 
-        # Feature-based quick decisions for commonly confused digits
-        if br < 0.20 and tr > 0.50:
-            return 7  # 7: empty bottom-right, filled top-right
-        if bl < 0.15 and tl > 0.50:
-            return 9  # 9: empty bottom-left, filled top-left
-        if fill > 0.52 and center > 0.45:
-            return 8  # 8: highest fill and center density
-        if bl > 0.50 and tr > 0.50 and center < 0.35:
-            return 0  # 0: ring shape, low center
-        if bl > 0.55 and tl < 0.35:
-            return 2  # 2: heavy bottom-left, light top-left
-        if tl > 0.45 and bl > 0.45 and center > 0.55:
-            return 6  # 6: filled left side + center
-
-        # Stage 2: Bitmap correlation for remaining cases
+        # Bitmap correlation only (feature shortcuts disabled — caused errors on split digits)
         resized = cv2.resize(digit_img, (5, 7), interpolation=cv2.INTER_AREA)
         norm = resized.astype(np.float32) / 255.0
 
@@ -3312,6 +3436,43 @@ class L2MAutoKeyApp:
                     best_d = d
 
         return best_d
+
+    @classmethod
+    def _recognize_digit_with_confidence(cls, digit_img) -> tuple:
+        """Recognize digit and return (digit, confidence_score).
+        Higher confidence = more reliable recognition."""
+        h, w = digit_img.shape
+        if h < 2 or w < 1:
+            return (0, 0.0)
+        if w / h < 0.45:
+            return (1, 10.0)  # Very thin = definitely "1", high confidence
+        if w / h > 2.0:
+            return (0, 0.0)  # Noise
+
+        total = np.sum(digit_img > 0)
+        area = h * w
+        fill = total / area if area > 0 else 0
+        mh, mw = h // 2, w // 2
+        tl = np.sum(digit_img[:mh, :mw] > 0) / max(1, mh * mw)
+        tr = np.sum(digit_img[:mh, mw:] > 0) / max(1, mh * (w - mw))
+        bl = np.sum(digit_img[mh:, :mw] > 0) / max(1, (h - mh) * mw)
+        br = np.sum(digit_img[mh:, mw:] > 0) / max(1, (h - mh) * (w - mw))
+        ch = h // 3
+        center = np.sum(digit_img[ch:2*ch, :] > 0) / max(1, ch * w)
+
+        # Bitmap correlation with confidence (feature shortcuts disabled)
+        resized = cv2.resize(digit_img, (5, 7), interpolation=cv2.INTER_AREA)
+        norm = resized.astype(np.float32) / 255.0
+        refs = cls._get_digit_refs()
+        best_d, best_score = 0, -999
+        for d, bitmaps in refs.items():
+            for ref in bitmaps:
+                score = np.sum(norm * ref) - np.sum(norm * (1 - ref)) * 0.5
+                if score > best_score:
+                    best_score = score
+                    best_d = d
+
+        return (best_d, best_score)
 
     def _check_auto_potion(self, settings: dict, now: float):
         """Check potion count and auto-buy if below threshold.
