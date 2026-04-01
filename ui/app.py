@@ -33,6 +33,7 @@ from core.key_sender import KeySender, KEY_LIST
 from core.mouse_clicker import MouseClicker
 from core.hp_checker import HPChecker, hp_color, mp_color
 from core.boss_timer import BossTimer
+from core.net_radar import NetRadar
 from core.image_utils import load_image, match_template
 from core.hunting import HuntingChecker
 try:
@@ -391,6 +392,19 @@ class L2MAutoKeyApp:
         self.status_label.config(text=self.lang.get("status_active", "Status: Aktif"))
         self._log("Bot dimulai")
 
+        # Pre-fetch boss timer data from Supabase
+        try:
+            self._boss_timer = BossTimer()
+            bosses = self._boss_timer.fetch_bosses()
+            self._log(f"[BossTimer] Loaded {len(bosses)} bosses from Supabase")
+        except Exception as e:
+            self._boss_timer = BossTimer()
+            self._log(f"[BossTimer] Fetch failed: {e}")
+
+        # Network radar disabled — entity type 4/6 includes ALL players (party, friendly)
+        # causing false positives. Need game's radar warning packet decoded first.
+        self._net_radar = None
+
         # Sound detection disabled — loopback too unstable (data discontinuity)
         # Using visual-only radar detection
 
@@ -438,6 +452,10 @@ class L2MAutoKeyApp:
 
         if self.sound_detector and hasattr(self.sound_detector, '_running') and self.sound_detector._running:
             self.sound_detector.stop()
+
+        # Stop network radar
+        if hasattr(self, '_net_radar') and self._net_radar:
+            self._net_radar.stop()
 
         def _stop_worker():
             for t in self.threads:
@@ -727,38 +745,8 @@ class L2MAutoKeyApp:
 
                 now = time.time()
 
-                # RADAR ❗ — deteksi warna merah di posisi pasti, LANGSUNG escape
-                # Guard: 1) tidak di town, 2) radar feature enabled, 3) cooldown
-                radar_settings = self.tab_radar.collect_settings()
-                radar_any_enabled = (radar_settings.get("radar_scan_enabled")
-                                     or radar_settings.get("radar_condition1_enabled")
-                                     or radar_settings.get("radar_condition2_enabled")
-                                     or radar_settings.get("radar_warning_enabled"))
-                if (radar_any_enabled
-                        and not self.is_in_town
-                        and self._escaped_to_town_at == 0
-                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 10
-                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
-                    try:
-                        # Template match radar_alert.png (ini yang pernah berhasil detect)
-                        if self._is_radar_alert_visible(img):
-                            esc_key = radar_settings.get("radar_scan_escape_key", "")
-                            if not esc_key:
-                                esc_key = radar_settings.get("radar_condition1_key", "")
-                            if esc_key and self.key_sender:
-                                self._log(f"[RADAR] ❗ ESCAPE: {esc_key}")
-                                self.key_sender.send(esc_key)
-                                time.sleep(0.5)
-                                self.key_sender.send(esc_key)
-                                self._escaped_to_town_at = now
-                                self._radar_last_trigger_at = now
-                                self.is_in_town = True
-                                self.last_in_town_time = now
-                                self.do_auto_hunt = True
-                                self.stop_event.wait(3.0)
-                                continue
-                    except Exception:
-                        pass
+                # RADAR detection moved to _check_radar_actions (line ~888)
+                # Uses warning_1280.png + radar_1_/radar_3_ from original AutoKeyL2M v2.7
 
                 # 2. Check saved spots dialog every frame
                 dialog_open = self._is_saved_spots_dialog_open(img)
@@ -875,8 +863,10 @@ class L2MAutoKeyApp:
                 except Exception:
                     pass
 
-                # 12. Radar check FIRST (skip when in town or recently in town) — prioritas utama
-                if (not self.is_in_town and not self.isBlockedByMouseAction
+                # 12. Radar check — HIGHEST PRIORITY, runs even during other features
+                # Only skip if actually in town or just escaped
+                if (not self.is_in_town
+                        and self._escaped_to_town_at == 0
                         and (now - getattr(self, 'last_in_town_time', 0)) > 3):
                     self._check_radar_actions(img)
 
@@ -912,6 +902,52 @@ class L2MAutoKeyApp:
     # ──────────────────────────────────────────────
     #  Combat Escape (weapon → skill → teleport)
     # ──────────────────────────────────────────────
+
+    def _on_net_radar_enemy(self, info: dict):
+        """Callback from NetRadar — enemy player detected via network.
+        This fires INSTANTLY when server sends player entity packet.
+        Triggers escape without waiting for screen template matching."""
+        if self.is_in_town or self._escaped_to_town_at > 0:
+            return
+        if not self.key_sender:
+            return
+
+        now = time.time()
+        # Cooldown: don't retrigger within 15s
+        if (now - getattr(self, '_net_radar_last_trigger', 0)) < 15:
+            return
+
+        radar_settings = self.tab_radar.collect_settings()
+        radar_enabled = (radar_settings.get("radar_scan_enabled")
+                         or radar_settings.get("radar_condition1_enabled")
+                         or radar_settings.get("radar_warning_enabled"))
+        if not radar_enabled:
+            return
+
+        # Get escape key
+        esc_key = radar_settings.get("radar_scan_escape_key", "")
+        if not esc_key:
+            esc_key = radar_settings.get("radar_warning_key", "")
+        if not esc_key:
+            esc_key = radar_settings.get("radar_condition1_key", "")
+        if not esc_key:
+            return
+
+        nearby = info.get('total_nearby', 1)
+        self._log(f"[NetRadar] ENEMY DETECTED! ({nearby} players) → ESCAPE: {esc_key}")
+
+        self._net_radar_last_trigger = now
+
+        # IMMEDIATE escape — no delay, no template check
+        self.key_sender.send(esc_key)
+        time.sleep(0.3)
+        self.key_sender.send(esc_key)
+
+        self._escaped_to_town_at = now
+        self._radar_last_trigger_at = now
+        self.is_in_town = True
+        self.last_in_town_time = now
+        self.do_auto_hunt = True
 
     def _acquire_feature(self, name: str, timeout: float = 0.5) -> bool:
         """Try to acquire the feature lock. Returns True if acquired.
@@ -983,6 +1019,19 @@ class L2MAutoKeyApp:
         self._combat_escape_last_at = now
         self._log(f"Combat Escape! HP={hp_pct_int}% < {threshold}%")
 
+        try:
+            self._do_combat_escape(settings, hp_pct_int, threshold)
+        finally:
+            self._release_feature()
+
+    def _do_combat_escape(self, settings, hp_pct_int, threshold):
+        """Internal combat escape execution — always called with feature lock held."""
+        weapon_key = settings.get("combat_escape_weapon_key", "")
+        skill_key = settings.get("combat_escape_skill_key", "")
+        tp_key = settings.get("combat_escape_teleport_key", "")
+        weapon_back_key = settings.get("combat_escape_weapon_back_key", "")
+        potion_key = settings.get("combat_escape_potion_key", "")
+
         # === Detect skill state ===
         skill_state = "unknown"
         if skill_key and self.capturer:
@@ -996,26 +1045,29 @@ class L2MAutoKeyApp:
 
         # === Execute based on skill state ===
         if skill_state == "cooldown":
-            # Path B: skill on cooldown → teleport immediately, no weapon/skill
+            # Path B: skill on cooldown → teleport immediately
             self._log("[CE] Skill cooldown → TP NOW!")
 
         elif skill_state in ("active", "self"):
-            # Path C: skill already active → cancel 2x → TP
-            self._log(f"[CE] Skill active → cancel: {skill_key} (2x)")
-            self.key_sender.send(skill_key)
-            time.sleep(0.3)
+            # Path C: skill already active → cancel 2x + TP in burst
+            self._log(f"[CE] Cancel + TP burst!")
             self.key_sender.send(skill_key)
             time.sleep(0.15)
+            self.key_sender.send(skill_key)
+            time.sleep(0.05)
+            self.key_sender.send(tp_key)  # TP immediately after cancel
+            time.sleep(0.05)
+            self.key_sender.send(tp_key)
 
         else:
-            # Path A: skill idle/unknown → weapon → skill 2x → wait → cancel 2x → TP
+            # Path A: skill idle/unknown → weapon → skill 2x → wait → cancel 2x + TP burst
             if weapon_key:
                 self._log(f"[CE] Weapon: {weapon_key}")
                 self.key_sender.send(weapon_key)
                 time.sleep(0.3)
 
             if skill_key:
-                self._log(f"[CE] Skill activate: {skill_key} (2x)")
+                self._log(f"[CE] Skill: {skill_key} (2x)")
                 self.key_sender.send(skill_key)
                 time.sleep(0.4)
                 self.key_sender.send(skill_key)
@@ -1034,18 +1086,21 @@ class L2MAutoKeyApp:
                     except Exception:
                         pass
 
-                # Cancel skill 2x
-                self._log(f"[CE] Cancel: {skill_key} (2x)")
-                self.key_sender.send(skill_key)
-                time.sleep(0.3)
+                # Cancel 2x + TP in rapid burst — no gap for enemy stun
+                self._log(f"[CE] Cancel + TP burst!")
                 self.key_sender.send(skill_key)
                 time.sleep(0.15)
+                self.key_sender.send(skill_key)
+                time.sleep(0.05)
+                self.key_sender.send(tp_key)
+                time.sleep(0.05)
+                self.key_sender.send(tp_key)
 
-        # === TELEPORT — spam immediately, no delay ===
-        self._log(f"[CE] TP: {tp_key} (spam)")
-        for _ in range(5):
+        # === Continue TP spam ===
+        self._log(f"[CE] TP spam: {tp_key}")
+        for _ in range(3):
+            time.sleep(0.3)
             self.key_sender.send(tp_key)
-            time.sleep(0.4)
 
         # Set town state
         self._escaped_to_town_at = time.time()
@@ -1101,9 +1156,6 @@ class L2MAutoKeyApp:
             for _ in range(5):
                 self.key_sender.send(potion_key)
                 time.sleep(0.4)
-
-        # Release feature lock
-        self._release_feature()
 
     # ──────────────────────────────────────────────
     #  HP-based actions
@@ -1194,7 +1246,16 @@ class L2MAutoKeyApp:
                     cropped = img.crop((rx1, ry1, rx2, ry2))
                     crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
                     template_bgr, mask = load_image(warn_path)
-                    if match_template(crop_bgr, template_bgr, mask, threshold=0.65):
+                    # Scale template to match current resolution
+                    scale = h / 720.0
+                    if abs(scale - 1.0) > 0.05:
+                        th, tw = template_bgr.shape[:2]
+                        nw = max(1, int(tw * scale))
+                        nh = max(1, int(th * scale))
+                        template_bgr = cv2.resize(template_bgr, (nw, nh))
+                        if mask is not None:
+                            mask = cv2.resize(mask, (nw, nh))
+                    if match_template(crop_bgr, template_bgr, mask, threshold=0.60):
                         key = settings.get("radar_warning_key", "")
                         if key:
                             self._log(f"Warning target! Tekan {key} → kabur ke kota")
@@ -1463,57 +1524,108 @@ class L2MAutoKeyApp:
     # ──────────────────────────────────────────────
 
     def _load_radar_alert_template(self):
-        """Load radar alert template (once)."""
+        """Load radar alert templates (once). Tries small ❗ icon first (faster)."""
         if hasattr(self, '_radar_alert_tpl_loaded') and self._radar_alert_tpl_loaded:
             return
         self._radar_alert_tpl_loaded = True
         self._radar_alert_tpl = None
+        self._radar_warn_icon_tpl = None
+
+        # Primary: small ❗ icon (fast, reliable)
+        icon_path = os.path.join("assets", "radar_warn_icon.png")
+        if os.path.exists(icon_path):
+            try:
+                bgr, mask = load_image(icon_path)
+                self._radar_warn_icon_tpl = (bgr, mask)
+            except Exception:
+                pass
+
+        # Fallback: full radar entry
         path = os.path.join("assets", "radar_alert.png")
         if os.path.exists(path):
-            bgr, mask = load_image(path)
-            self._radar_alert_tpl = (bgr, mask)
+            try:
+                bgr, mask = load_image(path)
+                self._radar_alert_tpl = (bgr, mask)
+            except Exception:
+                pass
+
+    def _fast_radar_color_detect(self, img) -> bool:
+        """Fast radar detection — detect ❗ warning icon by RED COLOR.
+
+        The ❗ icon is bright red/orange on dark background.
+        Scans the radar area (right side, 55-80% x, 20-50% y) for
+        concentrated red pixels. Much faster than template matching.
+        """
+        w, h = img.size
+        # Radar area: right side of screen where player list appears
+        rx1 = int(w * 0.55)
+        ry1 = int(h * 0.15)
+        rx2 = int(w * 0.85)
+        ry2 = int(h * 0.55)
+
+        crop = img.crop((rx1, ry1, rx2, ry2))
+        crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+        crop_hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+
+        # Detect bright red/orange pixels (the ❗ icon color)
+        # Red hue: 0-10 or 170-180, high saturation, high value
+        mask_low = cv2.inRange(crop_hsv, (0, 150, 150), (10, 255, 255))
+        mask_high = cv2.inRange(crop_hsv, (170, 150, 150), (180, 255, 255))
+        # Also detect orange (the ❗ can be orange-red)
+        mask_orange = cv2.inRange(crop_hsv, (10, 150, 150), (25, 255, 255))
+
+        red_mask = cv2.bitwise_or(mask_low, mask_high)
+        red_mask = cv2.bitwise_or(red_mask, mask_orange)
+
+        red_pixels = np.count_nonzero(red_mask)
+        total_pixels = crop_hsv.shape[0] * crop_hsv.shape[1]
+        ratio = red_pixels / total_pixels if total_pixels > 0 else 0
+
+        # The ❗ icon is small but distinct — even 0.3% of radar area is enough
+        # (at 200x200 crop, ❗ icon is ~15x15 = 225px, ratio = 225/40000 = 0.56%)
+        return ratio > 0.003
 
     def _is_radar_alert_visible(self, img) -> bool:
-        """Check if radar alert notification is visible (enemy detected).
+        """Check if radar alert ❗ icon is visible (enemy detected).
 
-        Matches radar_alert.png template against right side of screen.
+        Uses small ❗ icon template (radar_warn_icon.png) for fast matching.
+        Searches right 40% of screen, top 60%.
         """
         self._load_radar_alert_template()
-        if self._radar_alert_tpl is None:
-            return False
 
         w, h = img.size
-        # Radar alert appears on the right 40% of screen, top 50%
-        rx1 = int(w * 0.60)
+        # Search area: right 45%, top 60% (where radar entries appear)
+        rx1 = int(w * 0.55)
         ry1 = 0
         rx2 = w
-        ry2 = int(h * 0.50)
+        ry2 = int(h * 0.60)
         cropped = img.crop((rx1, ry1, rx2, ry2))
         crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
-
-        tpl_bgr, tpl_mask = self._radar_alert_tpl
-        # Scale template to match resolution
-        scale = h / 720.0
-        th, tw = tpl_bgr.shape[:2]
-        new_w = max(1, int(tw * scale))
-        new_h = max(1, int(th * scale))
-
         bh, bw = crop_bgr.shape[:2]
-        if new_w > bw or new_h > bh:
-            # Scale down more
-            scale2 = min(bw / tw, bh / th) * 0.9
-            new_w = max(1, int(tw * scale2))
-            new_h = max(1, int(th * scale2))
+        scale = h / 720.0
 
-        scaled_tpl = cv2.resize(tpl_bgr, (new_w, new_h))
-        scaled_mask = cv2.resize(tpl_mask, (new_w, new_h)) if tpl_mask is not None else None
+        # Match full radar entry template (radar_alert.png — number + shield + name + ❗)
+        # Small ❗ icon disabled — too many false positives from game UI elements
+        if self._radar_alert_tpl is not None:
+            tpl_bgr, tpl_mask = self._radar_alert_tpl
+            th, tw = tpl_bgr.shape[:2]
+            new_w = max(1, int(tw * scale))
+            new_h = max(1, int(th * scale))
+            if new_w > bw or new_h > bh:
+                s2 = min(bw / tw, bh / th) * 0.9
+                new_w = max(1, int(tw * s2))
+                new_h = max(1, int(th * s2))
+            s_tpl = cv2.resize(tpl_bgr, (new_w, new_h))
+            s_mask = cv2.resize(tpl_mask, (new_w, new_h)) if tpl_mask is not None else None
+            if s_mask is not None:
+                result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+            else:
+                result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            if max_val > 0.80:
+                return True
 
-        if scaled_mask is not None:
-            result = cv2.matchTemplate(crop_bgr, scaled_tpl, cv2.TM_CCORR_NORMED, mask=scaled_mask)
-        else:
-            result = cv2.matchTemplate(crop_bgr, scaled_tpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(result)
-        return max_val > 0.8
+        return False
 
     # ──────────────────────────────────────────────
     #  Smart Boss Hunt (timer-driven)
@@ -1529,8 +1641,8 @@ class L2MAutoKeyApp:
         4. Wait + radar spam → boss bar → hit
         5. Boss dies → screenshot → TP back to farm
         """
-        boss_timer = BossTimer()
-        hunted_bosses = set()  # Track which bosses we already attempted this cycle
+        boss_timer = getattr(self, '_boss_timer', BossTimer())
+        hunted_bosses = set()
 
         while not self.stop_event.is_set():
             self.stop_event.wait(10)  # Poll every 10s
@@ -1616,7 +1728,10 @@ class L2MAutoKeyApp:
     def _execute_smart_boss_hunt(self, boss_name: str, settings: dict) -> bool:
         """Execute the full boss hunt sequence for one boss.
 
-        Returns True if boss was successfully hit (Participated).
+        Uses the existing _check_boss_or_zariche flow but with smart settings.
+        The Smart Boss Hunt provides the TIMING, the existing code does the MAP work.
+
+        Returns True if boss was found and teleported to.
         """
         hit_key = settings.get("smart_boss_hit_key", "")
         radar_key = settings.get("smart_boss_radar_key", "")
@@ -1625,266 +1740,49 @@ class L2MAutoKeyApp:
             return False
 
         self._load_boss_zariche_templates()
-        self.isBlockedByMouseAction = True
 
-        try:
-            # === STEP 1: Open map, find boss, find glowing skull ===
-            self._log(f"[SmartBoss] Opening map...")
-            self.key_sender.send("M")
-            time.sleep(2)
+        # Build settings that _check_boss_or_zariche expects
+        boss_settings = {
+            "check_boss_enabled": True,
+            "check_boss_interval": 0,  # No interval — trigger now
+            "check_boss_radar_key": radar_key,
+            "check_boss_hit_key": hit_key,
+            "check_boss_tele_after_min": 5,
+            "check_boss_areas": ["ALL"],  # Check ALL areas
+        }
 
-            img = self.capturer.capture()
-            if img is None:
-                return False
+        # Force reset the last check time so it triggers immediately
+        self._boss_last_check = 0
 
-            # Check it's the normal map
-            is_normal = self._has_template_in_fullscreen(img, self._normal_map_tpl, threshold=0.7)
-            if not is_normal:
-                self._log("[SmartBoss] Not normal map")
-                return False
+        # Track if we were in town before (means we teleported to boss)
+        was_in_town = self.is_in_town
 
-            # Click boss icon in map panel
-            self._log("[SmartBoss] Click boss icon...")
-            self.clicker.click_scaled(MAP_BOSS_ICON_1280[0], MAP_BOSS_ICON_1280[1])
-            time.sleep(2)
+        # Use existing boss check flow (handles map, area search, skull, TP, fight)
+        # _skip_lock=True because smart hunt already holds the feature lock
+        self._check_boss_or_zariche(boss_settings, kind="boss", _skip_lock=True)
 
-            # Find the boss in the area list by name
-            # Try each area to find where this boss is
-            areas = ["ALL", "Gludio", "Dion", "Giran", "Oren", "Aden"]
-            skull_found = False
+        # Check if we actually teleported (boss was found)
+        # If _boss_tele_at changed, we teleported to a boss
+        boss_found = getattr(self, '_boss_tele_at', 0) > 0
 
-            for area in areas:
-                if self.stop_event.is_set():
-                    return False
-
+        # Only screenshot if boss was actually found and we left farming spot
+        if boss_found:
+            try:
                 img = self.capturer.capture()
-                if img is None:
-                    continue
-
-                clicked = self._find_and_click_area(img, area)
-                if not clicked:
-                    continue
-
-                self._log(f"[SmartBoss] Checking area: {area}")
-                time.sleep(2)
-
-                img = self.capturer.capture()
-                if img is None:
-                    continue
-
-                # Check if boss icon is glowing (check_boss.jpg template)
-                has_boss = self._has_template_in_fullscreen(
-                    img, self._boss_template, threshold=0.7)
-                if not has_boss:
-                    continue
-
-                self._log(f"[SmartBoss] Boss found in {area}!")
-
-                # === STEP 2: Find glowing skull on map ===
-                # Template match check_boss.jpg against the map area (center 80%)
-                skull_pos = self._find_glowing_skull(img)
-                if skull_pos:
-                    self._log(f"[SmartBoss] Glowing skull at ({skull_pos[0]},{skull_pos[1]})")
-                    self.clicker.click(skull_pos[0], skull_pos[1])
-                    time.sleep(1)
-
-                    # Click teleport
-                    self.clicker.click_scaled(MAP_BOSS_ENTRY_1280[0], MAP_BOSS_ENTRY_1280[1])
-                    time.sleep(2)
-
-                    # Confirm teleport
-                    img2 = self.capturer.capture()
-                    if img2:
-                        confirm_pos = self._get_confirm_position(img2)
-                        if confirm_pos:
-                            self.clicker.click(confirm_pos[0], confirm_pos[1])
-                        else:
-                            self.clicker.click_scaled(1098, 533)
-                        time.sleep(2)
-
-                        # Confirm popup (scroll)
-                        img3 = self.capturer.capture()
-                        if img3:
-                            has_popup = self._has_template_in_fullscreen(
-                                img3, self._confirm_dialog_tpl, threshold=0.5)
-                            if has_popup or self._need_confirm(img3):
-                                self.clicker.click_scaled(740, 490)
-                                time.sleep(2)
-
-                    skull_found = True
-                    break
-                else:
-                    # No glowing skull found but boss icon lit → click boss entry
-                    self._log("[SmartBoss] No skull found, clicking boss entry...")
-                    self.clicker.click_scaled(MAP_BOSS_ENTRY_1280[0], MAP_BOSS_ENTRY_1280[1])
-                    time.sleep(2)
-
-                    img2 = self.capturer.capture()
-                    if img2:
-                        confirm_pos = self._get_confirm_position(img2)
-                        if confirm_pos:
-                            self.clicker.click(confirm_pos[0], confirm_pos[1])
-                        else:
-                            self.clicker.click_scaled(1098, 533)
-                        time.sleep(2)
-
-                        img3 = self.capturer.capture()
-                        if img3 and (self._has_template_in_fullscreen(
-                                img3, self._confirm_dialog_tpl, threshold=0.5)
-                                or self._need_confirm(img3)):
-                            self.clicker.click_scaled(740, 490)
-                            time.sleep(2)
-
-                    skull_found = True
-                    break
-
-            if not skull_found:
-                self._log(f"[SmartBoss] {boss_name} not found on map")
-                self._close_map()
-                return False
-
-            self._log(f"[SmartBoss] Teleported! Waiting for boss...")
-
-        finally:
-            self.isBlockedByMouseAction = False
-
-        # === STEP 3: Wait for boss + hit ===
-        self._log(f"[SmartBoss] Loading...")
-        self.stop_event.wait(5)
-
-        start = time.time()
-        max_wait = 300  # 5 minutes max
-        boss_appeared = False
-        hit_sent = False
-        hit_count = 0
-        gone_count = 0
-
-        while not self.stop_event.is_set():
-            elapsed = time.time() - start
-            if elapsed > max_wait:
-                self._log(f"[SmartBoss] Timeout 5m")
-                break
-
-            # Radar spam
-            if radar_key and self.key_sender:
-                self.key_sender.send(radar_key)
-
-            img = self.capturer.capture()
-            if img is None:
-                self.stop_event.wait(1)
-                continue
-
-            bar_visible = self._is_boss_target_bar_visible(img)
-
-            if bar_visible and not boss_appeared:
-                boss_appeared = True
-                gone_count = 0
-                self._log(f"[SmartBoss] BOSS BAR! Hitting...")
-                if hit_key and self.key_sender:
-                    self.key_sender.send(hit_key)
-                    hit_count = 1
-
-            elif bar_visible and boss_appeared:
-                gone_count = 0
-                # Keep hitting every 2s
-                if hit_key and self.key_sender and hit_count < 5:
-                    self.key_sender.send(hit_key)
-                    hit_count += 1
-
-            elif not bar_visible and boss_appeared:
-                gone_count += 1
-                if gone_count >= 3:
-                    self._log(f"[SmartBoss] Boss dead! Looting 15s...")
-                    self.stop_event.wait(15)
-                    break
-
-            elif not bar_visible and not boss_appeared:
-                if int(elapsed) % 15 == 0 and elapsed > 1:
-                    self._log(f"[SmartBoss] Waiting... ({elapsed:.0f}s)")
-
-            self.stop_event.wait(2)
-
-        # === STEP 4: Screenshot ===
-        self._log(f"[SmartBoss] Taking screenshot...")
-        try:
-            img = self.capturer.capture()
-            if img:
-                debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         '..', 'debug')
-                os.makedirs(debug_dir, exist_ok=True)
-                ts = time.strftime('%Y%m%d_%H%M%S')
-                path = os.path.join(debug_dir, f'boss_{boss_name}_{ts}.png')
-                img.save(path)
-                self._log(f"[SmartBoss] Screenshot: {path}")
-        except Exception:
-            pass
-
-        # === STEP 5: TP back to farm ===
-        self._log(f"[SmartBoss] TP back to farm...")
-        self._escaped_to_town_at = 0
-        self.is_in_town = False
-        if settings.get("auto_teleport_enabled"):
-            self._teleport_to_spot(settings)
-        self.do_auto_hunt = True
-
-        return boss_appeared
-
-    def _find_glowing_skull(self, img) -> tuple | None:
-        """Find the glowing boss skull icon on the map.
-
-        Uses check_boss.jpg template (red glowing skull).
-        Searches the center 70% of the screen (map area, excluding panels).
-        Returns (x, y) center of match, or None.
-        """
-        tpl_path = os.path.join("assets", "check_boss.jpg")
-        if not os.path.exists(tpl_path):
-            return None
-
-        tpl_data = load_image(tpl_path)
-        if tpl_data is None:
-            return None
-
-        tpl_bgr, tpl_mask = tpl_data
-        w, h = img.size
-
-        # Search center of map (exclude left panel 15%, right panel 15%, top 10%, bottom 10%)
-        rx1 = int(w * 0.15)
-        ry1 = int(h * 0.10)
-        rx2 = int(w * 0.85)
-        ry2 = int(h * 0.90)
-
-        crop = img.crop((rx1, ry1, rx2, ry2))
-        crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
-        ch, cw = crop_bgr.shape[:2]
-
-        # Scale template
-        scale = h / 720.0
-        th, tw = tpl_bgr.shape[:2]
-        if abs(scale - 1.0) > 0.05:
-            new_w = max(1, int(tw * scale))
-            new_h = max(1, int(th * scale))
-            if new_w < cw and new_h < ch:
-                tpl_bgr = cv2.resize(tpl_bgr, (new_w, new_h))
-                if tpl_mask is not None:
-                    tpl_mask = cv2.resize(tpl_mask, (new_w, new_h))
-                th, tw = new_h, new_w
-
-        if th > ch or tw > cw:
-            return None
-
-        if tpl_mask is not None:
-            result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCORR_NORMED, mask=tpl_mask)
+                if img:
+                    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             '..', 'debug')
+                    os.makedirs(debug_dir, exist_ok=True)
+                    ts = time.strftime('%Y%m%d_%H%M%S')
+                    path = os.path.join(debug_dir, f'boss_{boss_name}_{ts}.png')
+                    img.save(path)
+                    self._log(f"[SmartBoss] Screenshot: {path}")
+            except Exception:
+                pass
+            return True
         else:
-            result = cv2.matchTemplate(crop_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-        self._log(f"[SmartBoss] Skull match: {max_val:.2f}")
-
-        if max_val >= 0.65:
-            cx = rx1 + max_loc[0] + tw // 2
-            cy = ry1 + max_loc[1] + th // 2
-            return (cx, cy)
-        return None
+            self._log(f"[SmartBoss] {boss_name} not found on map, no screenshot")
+            return False
 
     def _radar_scan_loop(self):
         """Radar scan loop — spam radar key, check for alerts, trigger escape."""
@@ -1917,22 +1815,43 @@ class L2MAutoKeyApp:
                 self.key_sender.send(scan_key)
                 time.sleep(0.5)
 
-                # Visual check radar_alert.png setelah scan
+                # Visual check using warning_1280.png (scaled to current resolution)
                 if self.capturer:
                     img = self.capturer.capture()
-                    if img and self._is_radar_alert_visible(img):
-                        self._log(f"[RADAR] Scan detect! Escape: {escape_key}")
-                        if escape_key:
-                            self.key_sender.send(escape_key)
-                            time.sleep(0.3)
-                            self.key_sender.send(escape_key)
-                        self._escaped_to_town_at = time.time()
-                        self._radar_last_trigger_at = time.time()
-                        self.is_in_town = True
-                        self.last_in_town_time = time.time()
-                        self.do_auto_hunt = True
-                        time.sleep(3.0)
-                        continue
+                    if img:
+                        w, h = img.size
+                        warn_path = get_warning_template_path(w)
+                        if os.path.exists(warn_path):
+                            try:
+                                warn_region = get_warning_region(w)
+                                rx1, ry1, rx2, ry2 = denormalize(warn_region, w, h)
+                                cropped = img.crop((rx1, ry1, rx2, ry2))
+                                crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
+                                template_bgr, tpl_mask = load_image(warn_path)
+                                # Scale template to current resolution
+                                scale = h / 720.0
+                                if abs(scale - 1.0) > 0.05:
+                                    th, tw = template_bgr.shape[:2]
+                                    nw = max(1, int(tw * scale))
+                                    nh = max(1, int(th * scale))
+                                    template_bgr = cv2.resize(template_bgr, (nw, nh))
+                                    if tpl_mask is not None:
+                                        tpl_mask = cv2.resize(tpl_mask, (nw, nh))
+                                if match_template(crop_bgr, template_bgr, tpl_mask, threshold=0.60):
+                                    self._log(f"[RADAR] Scan detect! Escape: {escape_key}")
+                                    if escape_key:
+                                        self.key_sender.send(escape_key)
+                                        time.sleep(0.3)
+                                        self.key_sender.send(escape_key)
+                                    self._escaped_to_town_at = time.time()
+                                    self._radar_last_trigger_at = time.time()
+                                    self.is_in_town = True
+                                    self.last_in_town_time = time.time()
+                                    self.do_auto_hunt = True
+                                    time.sleep(3.0)
+                                    continue
+                            except Exception:
+                                pass
 
                 self.stop_event.wait(interval)
 
@@ -2639,7 +2558,7 @@ class L2MAutoKeyApp:
         """Check zariche — wrapper yang loop area."""
         self._check_boss_or_zariche(settings, kind="zariche")
 
-    def _check_boss_or_zariche(self, settings: dict, kind: str = "boss"):
+    def _check_boss_or_zariche(self, settings: dict, kind: str = "boss", _skip_lock: bool = False):
         """Unified boss/zariche check — loop selected areas di map.
 
         Flow:
@@ -2668,16 +2587,20 @@ class L2MAutoKeyApp:
         self._load_boss_zariche_templates()
         now = time.time()
 
-        # Acquire feature lock — skip if another feature is running
-        if not self._acquire_feature(f"check_{kind}", timeout=0.5):
-            self._log(f"[{kind.capitalize()}] Waiting for {self._feature_active}...")
-            return
+        # Acquire feature lock — skip if called from smart hunt (already locked)
+        has_lock = _skip_lock
+        if not _skip_lock:
+            if not self._acquire_feature(f"check_{kind}", timeout=0.5):
+                self._log(f"[{kind.capitalize()}] Waiting for {self._feature_active}...")
+                return
+            has_lock = True
 
-        # Interval check
+        # Interval check (skip if called from smart hunt with interval=0)
         last_check = getattr(self, last_check_attr, 0)
         interval_sec = settings.get(interval_key, 5) * 60
-        if (now - last_check) < interval_sec:
-            self._release_feature()
+        if interval_sec > 0 and (now - last_check) < interval_sec:
+            if has_lock and not _skip_lock:
+                self._release_feature()
             return
 
         setattr(self, last_check_attr, now)
@@ -2831,8 +2754,9 @@ class L2MAutoKeyApp:
                 self._close_map()
             # Unblock combat escape
             self.isBlockedByMouseAction = False
-            # Release feature lock
-            self._release_feature()
+            # Release feature lock (only if we acquired it)
+            if not _skip_lock:
+                self._release_feature()
 
     # ──────────────────────────────────────────────
     #  Daily tasks (bulk purchase, clan, daily claim)
@@ -3111,7 +3035,7 @@ class L2MAutoKeyApp:
         result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-        if max_val >= 0.70:
+        if max_val >= 0.60:
             # Return match top-left + template size (full template with mask)
             match_x = search_x1 + max_loc[0]
             match_y = search_y + max_loc[1]
@@ -3151,12 +3075,7 @@ class L2MAutoKeyApp:
 
         Returns actual number via OCR, or -1 if cannot find/read.
         """
-        # Verify we're capturing the actual game (not VS Code or other window)
-        # by checking the an_hue_icon stability marker
-        if hasattr(self, 'capturer') and self.capturer:
-            if not self.capturer.is_stable_an_hue_icon(img):
-                self._log("[Potion] Screen not game content (stability check failed)")
-                return -1
+        self._last_potion_digit_count = 0
 
         icon_pos = self._find_potion_icon(img)
         if icon_pos is None:
@@ -3288,6 +3207,9 @@ class L2MAutoKeyApp:
         if result == 0 and len(boxes) >= 2:
             self._log(f"[Potion] OCR got 0 but {len(boxes)} boxes found — unreliable, retry")
             return -1
+
+        # Store digit count for reliability check
+        self._last_potion_digit_count = len(digits)
 
         self._log(f"[Potion] OCR: '{number_str}' = {result} "
                   f"[{len(boxes)} boxes: {', '.join(box_info)}] "
@@ -3425,30 +3347,43 @@ class L2MAutoKeyApp:
         threshold = settings.get("potion_threshold", 100)
 
         count = self._read_potion_count(img)
-        self._log(f"[Potion] Count: {count} (threshold: {threshold})")
+        digit_count = getattr(self, '_last_potion_digit_count', 0)
+        self._log(f"[Potion] Count: {count} digits={digit_count} (threshold: {threshold})")
+
+        # Update status display
+        self.root.after(0, self.tab_farming.potion_status.config,
+                        {"text": f"Potion: ~{count}" if count > 0 else "Potion: ?"})
 
         if count < 0:
-            # Cannot read (icon blocked by effects) — DON'T reset counter, just skip
-            # Recheck sooner (5s) in case effects clear
             self._potion_last_check = now - interval_sec + 5
+            return
+
+        # Use DIGIT COUNT as primary check (more reliable than OCR value)
+        # 4 digits = 1000-9999 → definitely OK
+        # 3 digits = 100-999 → check OCR value against threshold
+        # 1-2 digits = 0-99 → likely LOW (but could be OCR error)
+        if digit_count >= 4:
+            # 4 digits = definitely above any reasonable threshold
+            self._potion_low_count = 0
+            return
+        if digit_count == 3 and count >= threshold:
+            self._potion_low_count = 0
             return
         if count >= threshold:
             self._potion_low_count = 0
-            self.root.after(0, self.tab_farming.potion_status.config,
-                            {"text": f"Potion: {count} OK"})
             return
 
-        # Count is low — require 2 consecutive low reads to avoid false triggers
+        # Count appears low — require 3 consecutive low reads (was 2)
         if not hasattr(self, '_potion_low_count'):
             self._potion_low_count = 0
         self._potion_low_count += 1
 
-        if self._potion_low_count < 2:
-            self._log(f"[Potion] Low read #{self._potion_low_count}, rechecking in 10s...")
-            self._potion_last_check = now - interval_sec + 10  # Recheck in 10s
+        if self._potion_low_count < 3:
+            self._log(f"[Potion] Low read #{self._potion_low_count}/3, rechecking in 10s...")
+            self._potion_last_check = now - interval_sec + 10
             return
 
-        # Confirmed low — double-check with multiple retries (effects may block icon)
+        # Confirmed low — double-check with HIGH SCORE reads only
         confirm_ok = False
         for retry in range(5):
             time.sleep(1)
@@ -3523,14 +3458,15 @@ class L2MAutoKeyApp:
                 self._log(f"[Potion] Tunggu NPC list muncul... (attempt {attempt+1})")
                 gm_pos = self._wait_for_template_in_region(
                     "general_merchant_btn.png", timeout=10,
-                    region_y_min=0.0, region_y_max=1.0,
-                    region_x_min=0.0, region_x_max=0.35
+                    region_y_min=0.0, region_y_max=0.50,
+                    region_x_min=0.0, region_x_max=0.35,
+                    threshold=0.80
                 )
                 if gm_pos is None:
                     self._log("[Potion] General Merchant not found!")
                     continue
 
-                self._log("[Potion] Klik General Merchant...")
+                self._log(f"[Potion] Klik General Merchant at ({gm_pos[0]},{gm_pos[1]})...")
                 self.clicker.click(gm_pos[0], gm_pos[1])
 
                 # 3. Wait for character to walk + verify shop open
@@ -3546,10 +3482,39 @@ class L2MAutoKeyApp:
                     shop_opened = True
                     break
                 else:
-                    self._log("[Potion] Shop tidak terbuka, retry klik GM...")
+                    # Wrong NPC or shop didn't open
+                    # Check if some other dialog/window opened (not shop)
+                    self._log("[Potion] Shop tidak terbuka, cek dialog lain...")
+                    check_img = self.capturer.capture()
+                    if check_img:
+                        # If close button visible → something opened, close it
+                        close_pos = self._wait_for_template_in_region(
+                            "close.jpg", timeout=2, threshold=0.6,
+                            region_y_min=0.0, region_y_max=0.20,
+                            region_x_min=0.50, region_x_max=1.0
+                        )
+                        if close_pos:
+                            self._log("[Potion] Dialog terbuka (bukan shop), close...")
+                            self.clicker.click(close_pos[0], close_pos[1])
+                            time.sleep(1)
+                        else:
+                            # Nothing visible, just wait and retry
+                            self._log("[Potion] Tidak ada dialog, retry...")
+                            time.sleep(2)
 
             if not shop_opened:
-                self._log("[Potion] Shop gagal terbuka setelah 3x retry! Abort.")
+                self._log("[Potion] Shop gagal terbuka! Abort → biarkan TP otomatis handle.")
+                # Try to close any open dialog safely
+                check_img = self.capturer.capture()
+                if check_img:
+                    close_pos = self._wait_for_template_in_region(
+                        "close.jpg", timeout=2, threshold=0.6,
+                        region_y_min=0.0, region_y_max=0.20,
+                        region_x_min=0.50, region_x_max=1.0
+                    )
+                    if close_pos:
+                        self.clicker.click(close_pos[0], close_pos[1])
+                        time.sleep(0.5)
                 return
 
             self._log("[Potion] Shop terbuka!")
@@ -3562,7 +3527,18 @@ class L2MAutoKeyApp:
                 region_x_min=0.70, region_x_max=1.0
             )
             if at_pos is None:
-                self._log("[Potion] Auto-Trade btn not found! Abort.")
+                self._log("[Potion] Auto-Trade btn not found! Close shop + abort.")
+                # Close shop via close button (not Escape which may do other things)
+                close_pos = self._wait_for_template_in_region(
+                    "close.jpg", timeout=3, threshold=0.6,
+                    region_y_min=0.0, region_y_max=0.20,
+                    region_x_min=0.50, region_x_max=1.0
+                )
+                if close_pos:
+                    self.clicker.click(close_pos[0], close_pos[1])
+                else:
+                    self.key_sender.send("Escape")
+                time.sleep(0.5)
                 return
 
             # 4. Click Auto-Trade button

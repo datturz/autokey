@@ -283,15 +283,15 @@ def get_warning_positions(img_width: int) -> list:
 
 
 def get_warning_region(img_width: int) -> tuple:
-    """Get a normalized warning region that covers all warning positions."""
-    # Warning icons appear in the upper-right area of screen
-    # These are approximate normalized regions based on pixel positions
-    if img_width >= 960:
-        # 1280x720: x=974..1182, y=133..248 → normalized
-        return (0.761, 0.184, 0.923, 0.344)
-    elif img_width >= 750:
-        # 800x450: x=605..738, y=134..155
-        return (0.756, 0.298, 0.923, 0.344)
-    else:
-        # 640x360: x=484..593, y=105..126
-        return (0.756, 0.292, 0.927, 0.350)
+    """Get normalized warning region — scales to ANY resolution.
+
+    Based on 1280x720 reference positions where ❗ icons appear:
+    - Rightmost: x=1166-1182 (91%-92% of width)
+    - Leftmost:  x=974-990  (76%-77% of width)
+    - Top:       y=133-152  (18%-21% of height)
+    - Bottom:    y=214-248  (30%-34% of height)
+
+    Add generous padding for different resolutions and radar layouts.
+    """
+    # Normalized from 1280x720 reference with padding
+    return (0.72, 0.15, 0.98, 0.50)

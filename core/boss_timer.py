@@ -29,7 +29,7 @@ class BossTimer:
         self._client = None
         self._bosses = []
         self._last_fetch = 0
-        self._fetch_interval = 30  # seconds between DB fetches
+        self._fetch_interval = 3600  # 1 hour between DB fetches
 
     def _get_client(self):
         """Lazy-init Supabase client."""
