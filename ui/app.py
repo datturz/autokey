@@ -1022,49 +1022,62 @@ class L2MAutoKeyApp:
             return
 
         try:
-            template_bgr, _ = load_image(combat_icon_path)
-            th, tw = template_bgr.shape[:2]
+            template_bgr_orig, _ = load_image(combat_icon_path)
             sh, sw = crop_bgr.shape[:2]
-            if th > sh or tw > sw:
+
+            # Multi-scale: template from 1280x720, scale to current resolution
+            # Scales: 0.5x (640), 0.625x (800), 0.75x (960), 1.0x (1280), 1.5x (1920)
+            scales = [0.5, 0.625, 0.75, 1.0, 1.25, 1.5]
+            best_val = 0
+            best_loc = None
+            best_th, best_tw = 0, 0
+
+            for scale in scales:
+                th_orig, tw_orig = template_bgr_orig.shape[:2]
+                new_w = max(10, int(tw_orig * scale))
+                new_h = max(10, int(th_orig * scale))
+                if new_h > sh or new_w > sw:
+                    continue
+
+                template_bgr = cv2.resize(template_bgr_orig, (new_w, new_h),
+                                          interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+
+                # Create red-channel mask from template:
+                # Only match pixels where RED is dominant (the glowing swords)
+                tmpl_hsv = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2HSV)
+                mask_lo = cv2.inRange(tmpl_hsv, (0, 40, 80), (15, 255, 255))
+                mask_hi = cv2.inRange(tmpl_hsv, (160, 40, 80), (180, 255, 255))
+                red_mask = cv2.bitwise_or(mask_lo, mask_hi)
+
+                if cv2.countNonZero(red_mask) < 30:
+                    continue
+
+                mask_3ch = cv2.merge([red_mask, red_mask, red_mask])
+                result = cv2.matchTemplate(crop_bgr, template_bgr,
+                                           cv2.TM_CCORR_NORMED, mask=mask_3ch)
+                _, max_val_s, _, max_loc_s = cv2.minMaxLoc(result)
+
+                if max_val_s > best_val:
+                    best_val = max_val_s
+                    best_loc = max_loc_s
+                    best_th, best_tw = new_h, new_w
+
+            if best_val < 0.88 or best_loc is None:
                 return
 
-            # Create red-channel mask from template:
-            # Only match pixels where RED is dominant (the glowing swords)
-            tmpl_hsv = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2HSV)
-            # Red hue wraps: 0-10 and 170-180, saturation > 40, value > 80
-            mask_lo = cv2.inRange(tmpl_hsv, (0, 40, 80), (15, 255, 255))
-            mask_hi = cv2.inRange(tmpl_hsv, (160, 40, 80), (180, 255, 255))
-            red_mask = cv2.bitwise_or(mask_lo, mask_hi)
-
-            # Need enough red pixels in template for reliable match
-            red_pixels = cv2.countNonZero(red_mask)
-            if red_pixels < 50:
-                return
-
-            # Convert to 3-channel mask for matchTemplate
-            mask_3ch = cv2.merge([red_mask, red_mask, red_mask])
-
-            result = cv2.matchTemplate(crop_bgr, template_bgr,
-                                       cv2.TM_CCORR_NORMED, mask=mask_3ch)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-            if max_val < 0.88:
-                return
-
-            # Step 2: Verify matched region has actual red concentration
-            mx, my = max_loc
-            roi = crop_bgr[my:my+th, mx:mx+tw]
+            # Verify matched region has actual red concentration
+            mx, my = best_loc
+            roi = crop_bgr[my:my+best_th, mx:mx+best_tw]
             roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             roi_lo = cv2.inRange(roi_hsv, (0, 40, 80), (15, 255, 255))
             roi_hi = cv2.inRange(roi_hsv, (160, 40, 80), (180, 255, 255))
             roi_red = cv2.countNonZero(cv2.bitwise_or(roi_lo, roi_hi))
-            roi_total = th * tw
-            red_ratio = roi_red / roi_total
+            red_ratio = roi_red / (best_th * best_tw)
 
             if red_ratio < 0.08:
                 return  # Not enough red in matched area — not combat icon
 
-            self._log(f"[CE-Backup] Combat icon detected! (score={max_val:.3f}, red={red_ratio:.1%})")
+            self._log(f"[CE-Backup] Combat icon detected! (score={best_val:.3f}, red={red_ratio:.1%})")
         except Exception:
             return
 
