@@ -435,7 +435,7 @@ class L2MAutoKeyApp:
 
         # Thread 6: Radar scan
         if settings.get("radar_scan_enabled"):
-            self._start_thread(self._radar_scan_loop, "radar_scan")
+            pass  # self._start_thread(self._radar_scan_loop, "radar_scan")  # disabled — causes false triggers
 
     def _start_thread(self, target, name, args=()):
         t = threading.Thread(target=target, args=args, daemon=True, name=name)
@@ -3089,12 +3089,10 @@ class L2MAutoKeyApp:
     def _find_potion_icon(self, img):
         """Find potion icon on screen via template matching with potion_icon.png.
 
-        Uses only the ICON portion (top 50%) for matching — the number part
-        changes and would bias the match position. Searches only the consumable
-        hotbar area (bottom 25%, x: 25-75%) to avoid skill bar false matches.
+        Resolution-aware: scales template and search area based on actual game size.
+        Template potion_icon.png was captured at 1280x720.
 
-        Returns (match_x, match_y, full_tw, full_th) where full_tw/full_th are
-        the FULL template dimensions (icon+number), so caller can crop number area.
+        Returns (match_x, match_y, full_tw, full_th) or None.
         """
         if not hasattr(self, '_potion_icon_tpl'):
             self._potion_icon_tpl = None
@@ -3106,12 +3104,9 @@ class L2MAutoKeyApp:
                 if data is not None:
                     tpl_bgr, tpl_mask = data
                     self._potion_full_th, self._potion_full_tw = tpl_bgr.shape[:2]
-                    # Create mask: top 60% = white (match), bottom 40% = black (ignore)
-                    # This way we match the icon but ignore the changing number
                     icon_mask = np.zeros(tpl_bgr.shape[:2], dtype=np.uint8)
                     cut_h = int(tpl_bgr.shape[0] * 0.60)
                     icon_mask[:cut_h, :] = 255
-                    # Convert to 3-channel mask for matchTemplate
                     icon_mask_3ch = cv2.merge([icon_mask, icon_mask, icon_mask])
                     self._potion_icon_tpl = (tpl_bgr, icon_mask_3ch)
 
@@ -3122,41 +3117,60 @@ class L2MAutoKeyApp:
         w, h = img.size
         img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        # Search only consumable hotbar: bottom 25% height, x: 25-75% width
-        search_y = int(h * 0.75)
-        search_x1 = int(w * 0.25)
-        search_x2 = int(w * 0.75)
+        # Search hotbar area — normalized percentages (works at any resolution)
+        search_y = int(h * 0.73)
+        search_x1 = int(w * 0.20)
+        search_x2 = int(w * 0.80)
         search_img = img_bgr[search_y:, search_x1:search_x2]
         sh, sw = search_img.shape[:2]
 
-        # Scale template + mask to match current resolution
+        # Scale template to match current resolution
+        # Template was captured at ~1280x720, scale proportionally
         scale = h / 720.0
         th, tw = tpl_bgr.shape[:2]
-        full_th = int(self._potion_full_th * scale) if abs(scale - 1.0) > 0.05 else self._potion_full_th
-        full_tw = int(self._potion_full_tw * scale) if abs(scale - 1.0) > 0.05 else self._potion_full_tw
-        s_tpl = tpl_bgr
-        s_mask = tpl_mask
-        if abs(scale - 1.0) > 0.05:
-            nw = max(1, int(tw * scale))
-            nh = max(1, int(th * scale))
-            if nw < sw and nh < sh:
-                s_tpl = cv2.resize(tpl_bgr, (nw, nh))
-                s_mask = cv2.resize(tpl_mask, (nw, nh))
-                th, tw = nh, nw
+        nw = max(1, int(tw * scale))
+        nh = max(1, int(th * scale))
+        if nw < sw and nh < sh:
+            s_tpl = cv2.resize(tpl_bgr, (nw, nh))
+            s_mask = cv2.resize(tpl_mask, (nw, nh))
+        else:
+            s_tpl = tpl_bgr
+            s_mask = tpl_mask
+            nw, nh = tw, th
 
-        if th > sh or tw > sw:
+        if nh > sh or nw > sw:
             return None
 
-        # Match with mask: only icon portion is compared, number area ignored
-        result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        # Try multiple scales if primary doesn't match (resolution might differ)
+        best_val = 0
+        best_loc = None
+        best_tw = nw
+        best_th = nh
 
-        if max_val >= 0.60:
-            # Return match top-left + template size (full template with mask)
-            match_x = search_x1 + max_loc[0]
-            match_y = search_y + max_loc[1]
-            self._log(f"[Potion] Icon found (score={max_val:.2f}) at ({match_x},{match_y})")
-            return (match_x, match_y, tw, th)
+        for scale_adj in [1.0, 0.9, 1.1, 0.8, 1.2]:
+            adj_w = max(1, int(nw * scale_adj))
+            adj_h = max(1, int(nh * scale_adj))
+            if adj_w >= sw or adj_h >= sh:
+                continue
+            adj_tpl = cv2.resize(tpl_bgr, (adj_w, adj_h))
+            adj_mask = cv2.resize(tpl_mask, (adj_w, adj_h))
+
+            result = cv2.matchTemplate(search_img, adj_tpl, cv2.TM_CCORR_NORMED, mask=adj_mask)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+                best_tw = adj_w
+                best_th = adj_h
+            if max_val >= 0.85:
+                break  # Good enough
+
+        if best_val >= 0.75 and best_loc is not None:
+            match_x = search_x1 + best_loc[0]
+            match_y = search_y + best_loc[1]
+            self._log(f"[Potion] Icon found (score={best_val:.2f}) at ({match_x},{match_y})")
+            return (match_x, match_y, best_tw, best_th)
 
         # Debug when not found
         if not hasattr(self, '_potion_find_debug'):
@@ -3193,13 +3207,7 @@ class L2MAutoKeyApp:
         self._last_potion_digit_count = 0
         w, h = img.size
 
-        # Method 1: Read from quickslot area (larger, clearer numbers)
-        # Quickslot area: bottom 15%, x: 15-55% (left side of skill bar)
-        qs_result = self._read_quickslot_potion(img)
-        if qs_result >= 0:
-            return qs_result
-
-        # Method 2: Fallback to hotbar icon match
+        # Find potion icon in hotbar, read number with Tesseract
         icon_pos = self._find_potion_icon(img)
         if icon_pos is None:
             return -1
@@ -3217,8 +3225,27 @@ class L2MAutoKeyApp:
         crop = img.crop((num_x1, num_y1, num_x2, num_y2))
         arr = np.array(crop)
 
-        # Use MAX channel — catches red/yellow/white text
-        # Threshold at 200 for clean digit separation.
+        # Try Tesseract OCR first (much more accurate)
+        try:
+            import pytesseract
+            pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+            arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            ch, cw = arr_bgr.shape[:2]
+            big = cv2.resize(arr_bgr, (cw*3, ch*3), interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+            _, tess_thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            config = '--psm 7 -c tessedit_char_whitelist=0123456789'
+            tess_result = pytesseract.image_to_string(tess_thresh, config=config).strip()
+            if tess_result and tess_result.isdigit():
+                val = int(tess_result)
+                self._last_potion_digit_count = len(tess_result)
+                self._log(f"[Potion] Tesseract: '{tess_result}' = {val} "
+                          f"crop={num_x2-num_x1}x{num_y2-num_y1}px")
+                return val
+        except Exception:
+            pass  # Tesseract not available, fallback to bitmap OCR
+
+        # Fallback: bitmap OCR
         max_channel = np.max(arr, axis=2)
         _, thresh = cv2.threshold(max_channel, 200, 255, cv2.THRESH_BINARY)
 
