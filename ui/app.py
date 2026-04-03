@@ -435,7 +435,7 @@ class L2MAutoKeyApp:
 
         # Thread 6: Radar scan
         if settings.get("radar_scan_enabled"):
-            pass  # self._start_thread(self._radar_scan_loop, "radar_scan")  # disabled — causes false triggers
+            self._start_thread(self._radar_key_spam_loop, "radar_key_spam")
 
     def _start_thread(self, target, name, args=()):
         t = threading.Thread(target=target, args=args, daemon=True, name=name)
@@ -836,9 +836,14 @@ class L2MAutoKeyApp:
                                 self.is_in_town = False
                                 self.last_in_hunting_time = now
                                 self.last_in_town_time = 0
+                                # Full reset ALL features — clean state for hunting
                                 self._escaped_to_town_at = 0
-                                self._radar_last_trigger_at = 0  # Reset radar cooldown
-                                self._log("Kembali hunting")
+                                self._radar_last_trigger_at = 0
+                                self._combat_escape_triggered = False
+                                self._combat_escape_last_at = 0
+                                self._potion_low_count = 0
+                                self._potion_buy_active = False
+                                self._log("Kembali hunting (all features reset)")
                             self._prev_in_town = in_town_now
 
                     if not self.is_in_town:
@@ -865,16 +870,23 @@ class L2MAutoKeyApp:
 
                 # 12. Combat Escape FIRST (HP critical = immediate action)
                 # SKIP saat map terbuka (isBlockedByMouseAction)
+                # Radar + Combat Escape are ONE UNIT:
+                # Radar detects enemy → escape. If radar fails → combat escape handles HP drop.
+                # Both run independently, both can trigger escape.
+                # Only blocked when already in town or already escaped.
+                if (not self.is_in_town
+                        and self._escaped_to_town_at == 0
+                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
+                    self._check_radar_actions(img)
+
                 if not self.is_in_town and not self.isBlockedByMouseAction:
                     self._check_combat_escape(hp_pct)
 
-                # 13. Radar check — runs if combat escape didn't trigger
-                # Skip if just escaped (combat or radar) or in town
-                if (not self.is_in_town
-                        and self._escaped_to_town_at == 0
-                        and not self._combat_escape_triggered
-                        and (now - getattr(self, 'last_in_town_time', 0)) > 3):
-                    self._check_radar_actions(img)
+                # 12b. Backup Combat Escape: detect combat icon (darkness = HP invisible)
+                # No _combat_escape_triggered check — selama icon terdeteksi, terus trigger
+                if (not self.is_in_town and not self.isBlockedByMouseAction
+                        and self._escaped_to_town_at == 0):
+                    self._check_combat_icon_escape(img)
 
                 # 10. HP-based actions (skip saat map terbuka)
                 if not self.isBlockedByMouseAction:
@@ -970,6 +982,111 @@ class L2MAutoKeyApp:
         """Check if any feature is currently running."""
         return self._feature_active != ""
 
+    def _check_combat_icon_escape(self, img):
+        """Backup Combat Escape: detect combat icon (crossed swords).
+
+        When character is under Darkness debuff, HP bar is invisible.
+        Bot can't calculate HP → normal CE won't trigger.
+        This backup detects the red combat icon on screen and triggers CE.
+        Selama icon terdeteksi, terus trigger — cooldown pendek (3s).
+        """
+        settings = self.tab_farming.collect_settings()
+        if not settings.get("combat_escape_enabled"):
+            return
+        if not settings.get("combat_escape_icon_backup", True):
+            return
+        if not self.key_sender:
+            return
+
+        # Short cooldown — agresif selama icon masih terdeteksi
+        now = time.time()
+        if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 3:
+            return
+
+        # Search for combat icon in the right-center area of screen
+        # Icon appears near character model (~80-100% X, ~55-80% Y)
+        w, h = img.size
+        rx1 = int(w * 0.78)
+        ry1 = int(h * 0.50)
+        rx2 = int(w * 1.00)
+        ry2 = int(h * 0.82)
+
+        cropped = img.crop((rx1, ry1, rx2, ry2))
+        crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
+
+        # Step 1: Template match with RED-only mask
+        # Only compare red-glowing pixels, ignore dark background
+        combat_icon_path = os.path.join("assets", "combat_icon.png")
+        if not os.path.exists(combat_icon_path):
+            return
+
+        try:
+            template_bgr, _ = load_image(combat_icon_path)
+            th, tw = template_bgr.shape[:2]
+            sh, sw = crop_bgr.shape[:2]
+            if th > sh or tw > sw:
+                return
+
+            # Create red-channel mask from template:
+            # Only match pixels where RED is dominant (the glowing swords)
+            tmpl_hsv = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2HSV)
+            # Red hue wraps: 0-10 and 170-180, saturation > 40, value > 80
+            mask_lo = cv2.inRange(tmpl_hsv, (0, 40, 80), (15, 255, 255))
+            mask_hi = cv2.inRange(tmpl_hsv, (160, 40, 80), (180, 255, 255))
+            red_mask = cv2.bitwise_or(mask_lo, mask_hi)
+
+            # Need enough red pixels in template for reliable match
+            red_pixels = cv2.countNonZero(red_mask)
+            if red_pixels < 50:
+                return
+
+            # Convert to 3-channel mask for matchTemplate
+            mask_3ch = cv2.merge([red_mask, red_mask, red_mask])
+
+            result = cv2.matchTemplate(crop_bgr, template_bgr,
+                                       cv2.TM_CCORR_NORMED, mask=mask_3ch)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val < 0.88:
+                return
+
+            # Step 2: Verify matched region has actual red concentration
+            mx, my = max_loc
+            roi = crop_bgr[my:my+th, mx:mx+tw]
+            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            roi_lo = cv2.inRange(roi_hsv, (0, 40, 80), (15, 255, 255))
+            roi_hi = cv2.inRange(roi_hsv, (160, 40, 80), (180, 255, 255))
+            roi_red = cv2.countNonZero(cv2.bitwise_or(roi_lo, roi_hi))
+            roi_total = th * tw
+            red_ratio = roi_red / roi_total
+
+            if red_ratio < 0.08:
+                return  # Not enough red in matched area — not combat icon
+
+            self._log(f"[CE-Backup] Combat icon detected! (score={max_val:.3f}, red={red_ratio:.1%})")
+        except Exception:
+            return
+
+        # Trigger combat escape with hp_pct=0 (darkness = can't read HP)
+        tp_key = settings.get("combat_escape_teleport_key", "")
+        if not tp_key:
+            return
+
+        if not self._acquire_feature("combat_escape", timeout=2.0):
+            self._log(f"[CE-Backup] Waiting for {self._feature_active}...")
+            return
+
+        self._combat_escape_triggered = True
+        self._combat_escape_last_at = now
+        self._combat_icon_escape_last_at = now
+        self._log("[CE-Backup] Combat Escape triggered by combat icon!")
+        self._save_combat_escape_screenshot("CombatIcon")
+
+        try:
+            self._do_combat_escape(settings, 0, 0)
+        finally:
+            self._release_feature()
+
     def _check_combat_escape(self, hp_pct_int: int):
         """Combat Escape: HP below threshold → skill → cancel → teleport.
 
@@ -1019,89 +1136,75 @@ class L2MAutoKeyApp:
         self._combat_escape_triggered = True
         self._combat_escape_last_at = now
         self._log(f"Combat Escape! HP={hp_pct_int}% < {threshold}%")
+        self._save_combat_escape_screenshot(f"HP{hp_pct_int}")
 
         try:
             self._do_combat_escape(settings, hp_pct_int, threshold)
         finally:
             self._release_feature()
 
+    def _save_combat_escape_screenshot(self, reason: str):
+        """Save screenshot when combat escape triggers for debugging."""
+        try:
+            img = self.capturer.capture() if self.capturer else None
+            if not img:
+                return
+            if hasattr(sys, '_MEIPASS'):
+                base = os.path.dirname(sys.executable)
+            else:
+                base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ce_dir = os.path.join(base, "combat_escape_logs")
+            os.makedirs(ce_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            fname = f"CE_{reason}_{ts}.png"
+            img.save(os.path.join(ce_dir, fname))
+            self._log(f"[CE] Screenshot saved: {fname}")
+        except Exception:
+            pass
+
     def _do_combat_escape(self, settings, hp_pct_int, threshold):
-        """Internal combat escape execution — always called with feature lock held."""
+        """Internal combat escape — simple reliable flow:
+
+        1. Weapon switch
+        2. Skill 2x (activate: SELF popup + confirm)
+        3. Wait 1.5s (skill becomes active = stun immune)
+        4. Skill 2x (cancel)
+        5. TP spam (immediately after cancel, no gap)
+
+        No state detection — always full sequence.
+        If skill is on cooldown, presses do nothing (safe).
+        """
         weapon_key = settings.get("combat_escape_weapon_key", "")
         skill_key = settings.get("combat_escape_skill_key", "")
         tp_key = settings.get("combat_escape_teleport_key", "")
         weapon_back_key = settings.get("combat_escape_weapon_back_key", "")
         potion_key = settings.get("combat_escape_potion_key", "")
 
-        # === Detect skill state ===
-        skill_state = "unknown"
-        if skill_key and self.capturer:
-            try:
-                check_img = self.capturer.capture()
-                if check_img:
-                    skill_state = self._get_skill_state_by_template(check_img)
-                    self._log(f"[CE] Skill state: {skill_state}")
-            except Exception:
-                pass
-
-        # === Execute based on skill state ===
-        if skill_state == "cooldown":
-            # Path B: skill on cooldown → teleport immediately
-            self._log("[CE] Skill cooldown → TP NOW!")
-
-        elif skill_state in ("active", "self"):
-            # Path C: skill already active → cancel 2x + TP in burst
-            self._log(f"[CE] Cancel + TP burst!")
-            self.key_sender.send(skill_key)
-            time.sleep(0.15)
-            self.key_sender.send(skill_key)
-            time.sleep(0.05)
-            self.key_sender.send(tp_key)  # TP immediately after cancel
-            time.sleep(0.05)
-            self.key_sender.send(tp_key)
-
-        else:
-            # Path A: skill idle/unknown → weapon → skill 2x → wait → cancel 2x + TP burst
-            if weapon_key:
-                self._log(f"[CE] Weapon: {weapon_key}")
-                self.key_sender.send(weapon_key)
-                time.sleep(0.3)
-
-            if skill_key:
-                self._log(f"[CE] Skill: {skill_key} (2x)")
-                self.key_sender.send(skill_key)
-                time.sleep(0.4)
-                self.key_sender.send(skill_key)
-
-                # Wait for skill active (max 2s)
-                start_mon = time.time()
-                while (time.time() - start_mon) < 2.0:
-                    time.sleep(0.2)
-                    try:
-                        ci = self.capturer.capture()
-                        if ci:
-                            st = self._get_skill_state_by_template(ci)
-                            if st in ("active", "cooldown"):
-                                self._log(f"[CE] Skill → {st}")
-                                break
-                    except Exception:
-                        pass
-
-                # Cancel 2x + TP in rapid burst — no gap for enemy stun
-                self._log(f"[CE] Cancel + TP burst!")
-                self.key_sender.send(skill_key)
-                time.sleep(0.15)
-                self.key_sender.send(skill_key)
-                time.sleep(0.05)
-                self.key_sender.send(tp_key)
-                time.sleep(0.05)
-                self.key_sender.send(tp_key)
-
-        # === Continue TP spam ===
-        self._log(f"[CE] TP spam: {tp_key}")
-        for _ in range(3):
+        # Step 1: Weapon switch
+        if weapon_key:
+            self._log(f"[CE] Weapon: {weapon_key}")
+            self.key_sender.send(weapon_key)
             time.sleep(0.3)
-            self.key_sender.send(tp_key)
+
+        # Step 2: Skill 2x (press → 0.05s → press)
+        if skill_key:
+            self._log(f"[CE] Skill 2x")
+            self.key_sender.send(skill_key)
+            time.sleep(0.05)
+            self.key_sender.send(skill_key)
+
+            # Step 3: Wait 1s (skill active = stun immune)
+            time.sleep(1.0)
+
+            # Step 4: Cancel 2x BURST + TP BURST — zero gap
+            self._log(f"[CE] Cancel+TP")
+            self.key_sender.send(skill_key)
+            self.key_sender.send(skill_key)
+            for _ in range(10):
+                self.key_sender.send(tp_key)
+        else:
+            for _ in range(10):
+                self.key_sender.send(tp_key)
 
         # Set town state
         self._escaped_to_town_at = time.time()
@@ -1157,6 +1260,10 @@ class L2MAutoKeyApp:
             for _ in range(5):
                 self.key_sender.send(potion_key)
                 time.sleep(0.4)
+
+        # Reset potion state — prevent false trigger after combat escape
+        self._potion_low_count = 0
+        self._potion_last_check = time.time()
 
     # ──────────────────────────────────────────────
     #  HP-based actions
@@ -1224,9 +1331,14 @@ class L2MAutoKeyApp:
         settings = self.tab_radar.collect_settings()
         if not self.key_sender:
             return
-        if (not settings.get("radar_condition1_enabled")
-                and not settings.get("radar_condition2_enabled")
-                and not settings.get("radar_warning_enabled")):
+
+        # "Aktifkan Radar Scan" enables ALL detection (condition 1, 2, warning)
+        radar_scan_enabled = settings.get("radar_scan_enabled", False)
+        cond1 = settings.get("radar_condition1_enabled") or radar_scan_enabled
+        cond2 = settings.get("radar_condition2_enabled") or radar_scan_enabled
+        warn = settings.get("radar_warning_enabled") or radar_scan_enabled
+
+        if not cond1 and not cond2 and not warn:
             return
 
         # Cooldown after radar triggered — don't spam
@@ -1237,51 +1349,19 @@ class L2MAutoKeyApp:
 
         w, h = img.size
 
-        # Warning target detection → escape to town
-        if settings.get("radar_warning_enabled"):
-            warn_path = get_warning_template_path(w)
-            if os.path.exists(warn_path):
-                try:
-                    warn_region = get_warning_region(w)
-                    rx1, ry1, rx2, ry2 = denormalize(warn_region, w, h)
-                    cropped = img.crop((rx1, ry1, rx2, ry2))
-                    crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
-                    template_bgr, mask = load_image(warn_path)
-                    # Scale template to match current resolution
-                    scale = h / 720.0
-                    if abs(scale - 1.0) > 0.05:
-                        th, tw = template_bgr.shape[:2]
-                        nw = max(1, int(tw * scale))
-                        nh = max(1, int(th * scale))
-                        template_bgr = cv2.resize(template_bgr, (nw, nh))
-                        if mask is not None:
-                            mask = cv2.resize(mask, (nw, nh))
-                    if match_template(crop_bgr, template_bgr, mask, threshold=0.60):
-                        key = settings.get("radar_warning_key", "")
-                        if key:
-                            self._log(f"Warning target! Tekan {key} → kabur ke kota")
-                            self.key_sender.send(key)
-                            self._escaped_to_town_at = time.time()
-                            self._radar_last_trigger_at = time.time()
-                            self.is_in_town = True
-                            self.last_in_town_time = time.time()
-                            time.sleep(float(settings.get("radar_warning_delay", 3.0)))
-                            return
-                except Exception:
-                    pass
-
-        # Count radar targets once for both conditions
+        # Count radar targets FIRST (using radar_1_/radar_3_ templates)
+        # These are more reliable than warning icon alone
         count = 0
-        if settings.get("radar_condition1_enabled") or settings.get("radar_condition2_enabled"):
+        if cond1 or cond2:
             count = self._count_radar_targets(img)
 
         # Radar condition 2 first (more targets = higher priority)
-        if settings.get("radar_condition2_enabled") and count > 0:
+        if cond2 and count > 0:
             target_count = int(settings.get("radar_condition2_count", 2))
             if count >= target_count:
-                key = settings.get("radar_condition2_key", "")
+                key = settings.get("radar_condition2_key", "") or settings.get("radar_scan_escape_key", "")
                 if key:
-                    self._log(f"Radar kondisi 2: {count} >= {target_count} target! Tekan {key}")
+                    self._log(f"Radar: {count} >= {target_count} target! Tekan {key}")
                     self.key_sender.send(key)
                     self._escaped_to_town_at = time.time()
                     self._radar_last_trigger_at = time.time()
@@ -1291,12 +1371,12 @@ class L2MAutoKeyApp:
                     return
 
         # Radar condition 1
-        if settings.get("radar_condition1_enabled") and count > 0:
+        if cond1 and count > 0:
             target_count = int(settings.get("radar_condition1_count", 1))
             if count >= target_count:
-                key = settings.get("radar_condition1_key", "")
+                key = settings.get("radar_condition1_key", "") or settings.get("radar_scan_escape_key", "")
                 if key:
-                    self._log(f"Radar kondisi 1: {count} >= {target_count} target! Tekan {key}")
+                    self._log(f"Radar: {count} >= {target_count} target! Tekan {key}")
                     self.key_sender.send(key)
                     self._escaped_to_town_at = time.time()
                     self._radar_last_trigger_at = time.time()
@@ -1306,21 +1386,31 @@ class L2MAutoKeyApp:
 
     def _count_radar_targets(self, img) -> int:
         """Count radar targets using template matching on minimap.
-        Original checks 2 specific small regions (left + right of minimap)
-        for each radar_1_ and radar_3_ template."""
-        from core.game_layout import RADAR_TARGET_LEFT, RADAR_TARGET_RIGHT
+
+        Uses RADAR_TARGET_AREA (full radar number zone) with padding.
+        Searches for radar_1_/radar_3_ number templates AND radar_warn_icon.
+        Both a number AND warning icon must match to confirm enemy presence.
+        """
+        from core.game_layout import RADAR_TARGET_AREA
 
         w, h = img.size
 
-        # Two specific check regions (same as original vi_tri_1_ben_trai / ben_phai)
-        regions = [
-            denormalize(RADAR_TARGET_LEFT, w, h),
-            denormalize(RADAR_TARGET_RIGHT, w, h),
-        ]
+        # Use full radar area with extra padding so templates aren't clipped
+        ax1, ay1, ax2, ay2 = denormalize(RADAR_TARGET_AREA, w, h)
+        pad = 10
+        ax1 = max(0, ax1 - pad)
+        ay1 = max(0, ay1 - pad)
+        ax2 = min(w, ax2 + pad)
+        ay2 = min(h, ay2 + pad)
+
+        cropped = img.crop((ax1, ay1, ax2, ay2))
+        crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
 
         # Skip radar_1_640 if width > 660 (same as original)
         skip_640 = w > 660
 
+        # Step 1: Check for number templates (radar_1_ or radar_3_)
+        number_found = False
         for fname in os.listdir("assets"):
             if not (fname.startswith("radar_1_") or fname.startswith("radar_3_")):
                 continue
@@ -1331,16 +1421,56 @@ class L2MAutoKeyApp:
 
             try:
                 template_bgr, mask = load_image(os.path.join("assets", fname))
-
-                for (rx1, ry1, rx2, ry2) in regions:
-                    cropped = img.crop((rx1, ry1, rx2, ry2))
-                    crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
-                    if match_template(crop_bgr, template_bgr, mask, threshold=0.65):
-                        return 1  # Found at least 1 target
+                th, tw = template_bgr.shape[:2]
+                sh, sw = crop_bgr.shape[:2]
+                if th > sh or tw > sw:
+                    continue
+                if mask is not None:
+                    result = cv2.matchTemplate(crop_bgr, template_bgr, cv2.TM_CCORR_NORMED, mask=mask)
+                else:
+                    result = cv2.matchTemplate(crop_bgr, template_bgr, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                if max_val >= 0.82:
+                    number_found = True
+                    self._log(f"Radar: {fname} matched (score={max_val:.3f})")
+                    break
             except Exception:
                 pass
 
-        return 0
+        if not number_found:
+            return 0
+
+        # Step 2: Confirm with warning icon (radar_warn_icon.png)
+        # Enemy radar always shows number + ❗ icon together
+        warn_path = os.path.join("assets", "radar_warn_icon.png")
+        if os.path.exists(warn_path):
+            try:
+                # Use wider region for warning icon (it appears to the side of numbers)
+                warn_region = img.crop((
+                    max(0, ax1 - 40), max(0, ay1 - 20),
+                    min(w, ax2 + 40), min(h, ay2 + 20)
+                ))
+                warn_bgr = cv2.cvtColor(np.array(warn_region), cv2.COLOR_RGB2BGR)
+                warn_tmpl, warn_mask = load_image(warn_path)
+                wth, wtw = warn_tmpl.shape[:2]
+                wsh, wsw = warn_bgr.shape[:2]
+                if wth <= wsh and wtw <= wsw:
+                    if warn_mask is not None:
+                        result = cv2.matchTemplate(warn_bgr, warn_tmpl, cv2.TM_CCORR_NORMED, mask=warn_mask)
+                    else:
+                        result = cv2.matchTemplate(warn_bgr, warn_tmpl, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(result)
+                    if max_val >= 0.75:
+                        self._log(f"Radar: warn_icon confirmed (score={max_val:.3f})")
+                        return 1
+                    else:
+                        self._log(f"Radar: number found but warn_icon low (score={max_val:.3f}), skip")
+                        return 0
+            except Exception:
+                pass
+
+        # If warn icon file missing, fall back to number-only (but high threshold)
+        return 1
 
     # ──────────────────────────────────────────────
     #  Key sending with safety checks
@@ -1785,6 +1915,28 @@ class L2MAutoKeyApp:
             self._log(f"[SmartBoss] {boss_name} not found on map, no screenshot")
             return False
 
+    def _radar_key_spam_loop(self):
+        """Spam radar scan key (R) periodically. Detection is in main loop."""
+        settings = self.tab_radar.collect_settings()
+        scan_key = settings.get("radar_scan_key", "")
+        interval = settings.get("radar_scan_interval", 3)
+
+        if not scan_key or not self.key_sender:
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                if (self.is_in_town or self._escaped_to_town_at > 0
+                        or self.isBlockedByMouseAction
+                        or self._combat_escape_triggered):
+                    self.stop_event.wait(1)
+                    continue
+
+                self.key_sender.send(scan_key)
+                self.stop_event.wait(interval)
+            except Exception:
+                self.stop_event.wait(1)
+
     def _radar_scan_loop(self):
         """Radar scan loop — spam radar key, check for alerts, trigger escape."""
         settings = self.tab_radar.collect_settings()
@@ -1824,44 +1976,8 @@ class L2MAutoKeyApp:
                 if self._combat_escape_triggered or self._escaped_to_town_at > 0:
                     continue
 
-                # Visual check using warning_1280.png (scaled to current resolution)
-                if self.capturer:
-                    img = self.capturer.capture()
-                    if img:
-                        w, h = img.size
-                        warn_path = get_warning_template_path(w)
-                        if os.path.exists(warn_path):
-                            try:
-                                warn_region = get_warning_region(w)
-                                rx1, ry1, rx2, ry2 = denormalize(warn_region, w, h)
-                                cropped = img.crop((rx1, ry1, rx2, ry2))
-                                crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
-                                template_bgr, tpl_mask = load_image(warn_path)
-                                # Scale template to current resolution
-                                scale = h / 720.0
-                                if abs(scale - 1.0) > 0.05:
-                                    th, tw = template_bgr.shape[:2]
-                                    nw = max(1, int(tw * scale))
-                                    nh = max(1, int(th * scale))
-                                    template_bgr = cv2.resize(template_bgr, (nw, nh))
-                                    if tpl_mask is not None:
-                                        tpl_mask = cv2.resize(tpl_mask, (nw, nh))
-                                if match_template(crop_bgr, template_bgr, tpl_mask, threshold=0.60):
-                                    self._log(f"[RADAR] Scan detect! Escape: {escape_key}")
-                                    if escape_key:
-                                        self.key_sender.send(escape_key)
-                                        time.sleep(0.3)
-                                        self.key_sender.send(escape_key)
-                                    self._escaped_to_town_at = time.time()
-                                    self._radar_last_trigger_at = time.time()
-                                    self.is_in_town = True
-                                    self.last_in_town_time = time.time()
-                                    self.do_auto_hunt = True
-                                    time.sleep(3.0)
-                                    continue
-                            except Exception:
-                                pass
-
+                # Detection handled by _check_radar_actions in main loop
+                # This thread ONLY spams the R key
                 self.stop_event.wait(interval)
 
             except Exception as e:
@@ -1941,11 +2057,19 @@ class L2MAutoKeyApp:
                         self.letter_last_time = now
                         self._log("Auto check letter: tekan T")
 
-                # ── Auto Buy Potion (LOWER priority than radar) ──
-                # Skip if radar just triggered or is actively detecting
+                # ── Auto Buy Potion (LOWEST priority) ──
+                # Only runs when ALL higher priority features are idle:
+                # 1. Not in town (not after combat escape / radar escape)
+                # 2. No escape in progress
+                # 3. Radar hasn't triggered in last 30s
+                # 4. Combat escape hasn't triggered in last 60s
+                # 5. No feature lock active
                 if (not self.is_in_town
                         and self._escaped_to_town_at == 0
-                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 15):
+                        and not self._combat_escape_triggered
+                        and (now - getattr(self, '_radar_last_trigger_at', 0)) > 30
+                        and (now - getattr(self, '_combat_escape_last_at', 0)) > 60
+                        and not self._is_feature_busy()):
                     self._check_auto_potion(settings, now)
 
                 # ── Skip boss/zariche/daily saat di kota (escaped) ──
@@ -3626,6 +3750,7 @@ class L2MAutoKeyApp:
 
         # Block ALL other features during entire buy flow
         self.isBlockedByMouseAction = True
+        self._potion_buy_active = True
         try:
             # 1. TP to town — use dedicated potion TP key, fallback to combat escape key
             tp_key = settings.get("potion_tp_key", "")
@@ -3640,69 +3765,79 @@ class L2MAutoKeyApp:
                 self._log("[Potion] No TP key configured! Set 'Key TP ke town' di Auto Buy Potion")
                 return
 
-            # 2. Poll General Merchant + click + verify shop open (with retry)
+            # 2. Wait for NPC list to appear, find and click General Merchant
+            # The NPC list appears on left side (x: 0-40%, y: 5-50%)
+            # Scale template to current resolution for accurate matching
             shop_opened = False
-            for attempt in range(3):
-                self._log(f"[Potion] Tunggu NPC list muncul... (attempt {attempt+1})")
-                gm_pos = self._wait_for_template_in_region(
-                    "general_merchant_btn.png", timeout=10,
-                    region_y_min=0.0, region_y_max=0.50,
-                    region_x_min=0.0, region_x_max=0.35,
-                    threshold=0.80
-                )
+            for attempt in range(4):
+                if self.stop_event.is_set():
+                    return
+
+                self._log(f"[Potion] Cari General Merchant... (attempt {attempt+1})")
+
+                # Wait for screen to stabilize after TP
+                if attempt == 0:
+                    time.sleep(3)  # First attempt: wait for NPC list to load
+
+                # Search with multi-scale (resolution adaptive)
+                gm_pos = None
+                best_score = 0
+                for tpl_name in ["general_merchant_btn.png", "general_merchant.jpg"]:
+                    pos = self._wait_for_template_in_region(
+                        tpl_name, timeout=5,
+                        region_y_min=0.05, region_y_max=0.55,
+                        region_x_min=0.0, region_x_max=0.40,
+                        threshold=0.75
+                    )
+                    if pos is not None:
+                        gm_pos = pos
+                        break
+
                 if gm_pos is None:
                     self._log("[Potion] General Merchant not found!")
+                    time.sleep(2)
                     continue
 
                 self._log(f"[Potion] Klik General Merchant at ({gm_pos[0]},{gm_pos[1]})...")
                 self.clicker.click(gm_pos[0], gm_pos[1])
 
-                # 3. Wait for character to walk + verify shop open
+                # Wait for character to walk to merchant
                 self._log("[Potion] Tunggu karakter jalan ke merchant...")
-                time.sleep(3)
-                self._log("[Potion] Tunggu shop terbuka (inventory tabs)...")
+                time.sleep(4)
+
+                # Verify shop opened (inventory tabs visible)
+                self._log("[Potion] Tunggu shop terbuka...")
                 inv_pos = self._wait_for_template_in_region(
-                    "icon_inventory.png", timeout=12,
+                    "icon_inventory.png", timeout=10,
                     region_y_min=0.05, region_y_max=0.30,
-                    region_x_min=0.65, region_x_max=1.0
+                    region_x_min=0.60, region_x_max=1.0
                 )
                 if inv_pos is not None:
                     shop_opened = True
+                    self._log("[Potion] Shop terbuka!")
                     break
+
+                # Shop didn't open — close any wrong dialog
+                self._log("[Potion] Shop tidak terbuka, recovery...")
+                # Try close button first
+                close_pos = self._wait_for_template_in_region(
+                    "close.jpg", timeout=2, threshold=0.6,
+                    region_y_min=0.0, region_y_max=0.25,
+                    region_x_min=0.45, region_x_max=1.0
+                )
+                if close_pos:
+                    self._log("[Potion] Close dialog...")
+                    self.clicker.click(close_pos[0], close_pos[1])
+                    time.sleep(1)
                 else:
-                    # Wrong NPC or shop didn't open
-                    # Check if some other dialog/window opened (not shop)
-                    self._log("[Potion] Shop tidak terbuka, cek dialog lain...")
-                    check_img = self.capturer.capture()
-                    if check_img:
-                        # If close button visible → something opened, close it
-                        close_pos = self._wait_for_template_in_region(
-                            "close.jpg", timeout=2, threshold=0.6,
-                            region_y_min=0.0, region_y_max=0.20,
-                            region_x_min=0.50, region_x_max=1.0
-                        )
-                        if close_pos:
-                            self._log("[Potion] Dialog terbuka (bukan shop), close...")
-                            self.clicker.click(close_pos[0], close_pos[1])
-                            time.sleep(1)
-                        else:
-                            # Nothing visible, just wait and retry
-                            self._log("[Potion] Tidak ada dialog, retry...")
-                            time.sleep(2)
+                    # No dialog visible, press Escape as safety
+                    self.key_sender.send("Escape")
+                    time.sleep(1)
 
             if not shop_opened:
-                self._log("[Potion] Shop gagal terbuka! Abort → biarkan TP otomatis handle.")
-                # Try to close any open dialog safely
-                check_img = self.capturer.capture()
-                if check_img:
-                    close_pos = self._wait_for_template_in_region(
-                        "close.jpg", timeout=2, threshold=0.6,
-                        region_y_min=0.0, region_y_max=0.20,
-                        region_x_min=0.50, region_x_max=1.0
-                    )
-                    if close_pos:
-                        self.clicker.click(close_pos[0], close_pos[1])
-                        time.sleep(0.5)
+                self._log("[Potion] Shop gagal terbuka! Abort.")
+                self.key_sender.send("Escape")
+                time.sleep(0.5)
                 return
 
             self._log("[Potion] Shop terbuka!")
@@ -3795,13 +3930,16 @@ class L2MAutoKeyApp:
 
         finally:
             self.isBlockedByMouseAction = False
+            self._potion_buy_active = False
             self._release_feature()
 
-        # Setelah beli selesai, set town state
+        # Setelah beli selesai, set town state + reset potion counters
         self.is_in_town = True
         self.last_in_town_time = time.time()
         self._escaped_to_town_at = time.time()
         self.do_auto_hunt = True
+        self._potion_low_count = 0
+        self._potion_last_check = time.time()
         self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
 
     def _wait_for_template_in_region(self, template_name: str, timeout: int = 15,
@@ -3841,30 +3979,41 @@ class L2MAutoKeyApp:
             search_img = img_bgr[ry1:ry2, rx1:rx2]
             sh, sw = search_img.shape[:2]
 
-            scale = h / 720.0
-            th, tw = tpl_bgr.shape[:2]
-            s_tpl = tpl_bgr
-            s_mask = tpl_mask
-            if abs(scale - 1.0) > 0.05:
-                nw = max(1, int(tw * scale))
-                nh = max(1, int(th * scale))
-                if nw < sw and nh < sh:
-                    s_tpl = cv2.resize(tpl_bgr, (nw, nh))
-                    s_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
-                    th, tw = nh, nw
+            # Multi-scale template matching (adapts to any resolution)
+            base_scale = h / 720.0
+            th_orig, tw_orig = tpl_bgr.shape[:2]
+            best_val = 0
+            best_loc = None
+            best_tw = tw_orig
+            best_th = th_orig
 
-            if th <= sh and tw <= sw:
-                if s_mask is not None:
-                    result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
+            for scale_adj in [1.0, 0.9, 1.1, 0.85, 1.15]:
+                s = base_scale * scale_adj
+                nw = max(1, int(tw_orig * s))
+                nh = max(1, int(th_orig * s))
+                if nw >= sw or nh >= sh:
+                    continue
+                adj_tpl = cv2.resize(tpl_bgr, (nw, nh))
+                adj_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
+
+                if adj_mask is not None:
+                    result = cv2.matchTemplate(search_img, adj_tpl, cv2.TM_CCORR_NORMED, mask=adj_mask)
                 else:
-                    result = cv2.matchTemplate(search_img, s_tpl, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                    result = cv2.matchTemplate(search_img, adj_tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val_s, _, max_loc_s = cv2.minMaxLoc(result)
 
-                if max_val >= threshold:
-                    # Convert back to full screen coordinates
-                    cx = rx1 + max_loc[0] + tw // 2
-                    cy = ry1 + max_loc[1] + th // 2
-                    self._log(f"[Potion] {template_name} found (score={max_val:.2f}) at ({cx},{cy})")
+                if max_val_s > best_val:
+                    best_val = max_val_s
+                    best_loc = max_loc_s
+                    best_tw = nw
+                    best_th = nh
+                if max_val_s >= 0.90:
+                    break
+
+            if best_val >= threshold and best_loc is not None:
+                    cx = rx1 + best_loc[0] + best_tw // 2
+                    cy = ry1 + best_loc[1] + best_th // 2
+                    self._log(f"[Potion] {template_name} found (score={best_val:.2f}) at ({cx},{cy})")
                     return (cx, cy)
 
         return None
@@ -3918,7 +4067,7 @@ class L2MAutoKeyApp:
                 if max_val >= threshold:
                     cx = max_loc[0] + tw // 2
                     cy = max_loc[1] + th // 2
-                    self._log(f"[Potion] {template_name} found (score={max_val:.2f}) at ({cx},{cy})")
+                    self._log(f"[Potion] {template_name} found (score={best_val:.2f}) at ({cx},{cy})")
                     return (cx, cy)
 
         return None
