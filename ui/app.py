@@ -1003,13 +1003,14 @@ class L2MAutoKeyApp:
         if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 3:
             return
 
-        # Search for combat icon in the right-center area of screen
-        # Icon appears near character model (~80-100% X, ~55-80% Y)
+        # Search for combat icon ONLY to the RIGHT of X button
+        # Farming sword icon (left of X) has similar red color — must exclude it
+        # Combat icon appears right of X button: ~(0.87, 0.65) to (0.96, 0.79)
         w, h = img.size
-        rx1 = int(w * 0.78)
-        ry1 = int(h * 0.50)
-        rx2 = int(w * 1.00)
-        ry2 = int(h * 0.82)
+        rx1 = int(w * 0.87)
+        ry1 = int(h * 0.65)
+        rx2 = int(w * 0.96)
+        ry2 = int(h * 0.79)
 
         cropped = img.crop((rx1, ry1, rx2, ry2))
         crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
