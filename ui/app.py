@@ -1005,12 +1005,12 @@ class L2MAutoKeyApp:
 
         # Search for combat icon ONLY to the RIGHT of X button
         # Farming sword icon (left of X) has similar red color — must exclude it
-        # Combat icon appears right of X button: ~(0.87, 0.65) to (0.96, 0.79)
+        # Combat icon appears right of X button near edge: ~(0.85, 0.60) to (1.0, 0.82)
         w, h = img.size
-        rx1 = int(w * 0.87)
-        ry1 = int(h * 0.65)
-        rx2 = int(w * 0.96)
-        ry2 = int(h * 0.79)
+        rx1 = int(w * 0.85)
+        ry1 = int(h * 0.60)
+        rx2 = w  # all the way to right edge
+        ry2 = int(h * 0.82)
 
         cropped = img.crop((rx1, ry1, rx2, ry2))
         crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
@@ -1029,7 +1029,7 @@ class L2MAutoKeyApp:
             sh, sw = crop_gray.shape[:2]
 
             # Multi-scale: template from 1280x720, scale to current resolution
-            scales = [0.5, 0.625, 0.75, 1.0, 1.25, 1.5]
+            scales = [0.5, 0.625, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
             best_val = 0
 
             for scale in scales:
