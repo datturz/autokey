@@ -1048,7 +1048,7 @@ class L2MAutoKeyApp:
                 if max_val_s > best_val:
                     best_val = max_val_s
 
-            if best_val < 0.75:
+            if best_val < 0.85:
                 return
 
             self._log(f"[CE-Backup] Combat icon detected! (score={best_val:.3f})")
