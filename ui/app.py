@@ -1015,69 +1015,43 @@ class L2MAutoKeyApp:
         cropped = img.crop((rx1, ry1, rx2, ry2))
         crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
 
-        # Step 1: Template match with RED-only mask
-        # Only compare red-glowing pixels, ignore dark background
+        # Step 1: Grayscale SHAPE matching (not color-based)
+        # Red mask approach fails: spell effects flood region with red → false positive
+        # Grayscale TM_CCOEFF_NORMED matches the crossed-sword SHAPE reliably
         combat_icon_path = os.path.join("assets", "combat_icon.png")
         if not os.path.exists(combat_icon_path):
             return
 
         try:
             template_bgr_orig, _ = load_image(combat_icon_path)
-            sh, sw = crop_bgr.shape[:2]
+            crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            tmpl_gray_orig = cv2.cvtColor(template_bgr_orig, cv2.COLOR_BGR2GRAY)
+            sh, sw = crop_gray.shape[:2]
 
             # Multi-scale: template from 1280x720, scale to current resolution
-            # Scales: 0.5x (640), 0.625x (800), 0.75x (960), 1.0x (1280), 1.5x (1920)
             scales = [0.5, 0.625, 0.75, 1.0, 1.25, 1.5]
             best_val = 0
-            best_loc = None
-            best_th, best_tw = 0, 0
 
             for scale in scales:
-                th_orig, tw_orig = template_bgr_orig.shape[:2]
+                th_orig, tw_orig = tmpl_gray_orig.shape[:2]
                 new_w = max(10, int(tw_orig * scale))
                 new_h = max(10, int(th_orig * scale))
                 if new_h > sh or new_w > sw:
                     continue
 
-                template_bgr = cv2.resize(template_bgr_orig, (new_w, new_h),
-                                          interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+                tmpl_gray = cv2.resize(tmpl_gray_orig, (new_w, new_h),
+                                       interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
 
-                # Create red-channel mask from template:
-                # Only match pixels where RED is dominant (the glowing swords)
-                tmpl_hsv = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2HSV)
-                mask_lo = cv2.inRange(tmpl_hsv, (0, 40, 80), (15, 255, 255))
-                mask_hi = cv2.inRange(tmpl_hsv, (160, 40, 80), (180, 255, 255))
-                red_mask = cv2.bitwise_or(mask_lo, mask_hi)
-
-                if cv2.countNonZero(red_mask) < 30:
-                    continue
-
-                mask_3ch = cv2.merge([red_mask, red_mask, red_mask])
-                result = cv2.matchTemplate(crop_bgr, template_bgr,
-                                           cv2.TM_CCORR_NORMED, mask=mask_3ch)
-                _, max_val_s, _, max_loc_s = cv2.minMaxLoc(result)
+                result = cv2.matchTemplate(crop_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                _, max_val_s, _, _ = cv2.minMaxLoc(result)
 
                 if max_val_s > best_val:
                     best_val = max_val_s
-                    best_loc = max_loc_s
-                    best_th, best_tw = new_h, new_w
 
-            if best_val < 0.88 or best_loc is None:
+            if best_val < 0.75:
                 return
 
-            # Verify matched region has actual red concentration
-            mx, my = best_loc
-            roi = crop_bgr[my:my+best_th, mx:mx+best_tw]
-            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            roi_lo = cv2.inRange(roi_hsv, (0, 40, 80), (15, 255, 255))
-            roi_hi = cv2.inRange(roi_hsv, (160, 40, 80), (180, 255, 255))
-            roi_red = cv2.countNonZero(cv2.bitwise_or(roi_lo, roi_hi))
-            red_ratio = roi_red / (best_th * best_tw)
-
-            if red_ratio < 0.08:
-                return  # Not enough red in matched area — not combat icon
-
-            self._log(f"[CE-Backup] Combat icon detected! (score={best_val:.3f}, red={red_ratio:.1%})")
+            self._log(f"[CE-Backup] Combat icon detected! (score={best_val:.3f})")
         except Exception:
             return
 
