@@ -3704,7 +3704,7 @@ class L2MAutoKeyApp:
             # Only use general_merchant_btn.png (194x48, reliable text template)
             # Narrow region to NPC list only (left 20%, y 15-55%)
             # to avoid matching skill icons at top
-            gm_pos = self._find_general_merchant(timeout=8)
+            gm_pos = self._find_general_merchant(timeout=15)
 
             if gm_pos is None:
                 self._log("[Potion] General Merchant not found! Abort — biarkan TP handle.")
@@ -3845,8 +3845,10 @@ class L2MAutoKeyApp:
         pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
         start = time.time()
+        attempt = 0
         while (time.time() - start) < timeout:
-            time.sleep(1)
+            time.sleep(1.5)
+            attempt += 1
             img = self.capturer.capture()
             if img is None:
                 continue
@@ -3855,7 +3857,7 @@ class L2MAutoKeyApp:
             # NPC list: left side, below HP bar
             rx1 = 0
             ry1 = int(h * 0.12)
-            rx2 = int(w * 0.22)
+            rx2 = int(w * 0.25)
             ry2 = int(h * 0.55)
             npc_crop = img.crop((rx1, ry1, rx2, ry2))
 
@@ -3865,7 +3867,12 @@ class L2MAutoKeyApp:
                 _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
                 thresh_pil = Image.fromarray(thresh)
                 data = pytesseract.image_to_data(thresh_pil, output_type=pytesseract.Output.DICT)
-            except Exception:
+                # Debug: log what OCR reads
+                words = [data['text'][i].strip() for i in range(len(data['text']))
+                         if data['text'][i].strip() and int(data['conf'][i]) > 30]
+                self._log(f"[Potion] OCR attempt {attempt}: {words[:8]}")
+            except Exception as e:
+                self._log(f"[Potion] OCR error: {e}")
                 continue
 
             # Find "General" + "Merchant" on the same line (close Y)
