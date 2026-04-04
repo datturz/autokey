@@ -3702,13 +3702,9 @@ class L2MAutoKeyApp:
             time.sleep(3)  # Wait for NPC list to load
 
             # Only use general_merchant_btn.png (194x48, reliable text template)
-            # Small icon templates (16x16) cause miss clicks
-            gm_pos = self._wait_for_template_in_region(
-                "general_merchant_btn.png", timeout=8,
-                region_y_min=0.05, region_y_max=0.55,
-                region_x_min=0.0, region_x_max=0.40,
-                threshold=0.80
-            )
+            # Narrow region to NPC list only (left 20%, y 15-55%)
+            # to avoid matching skill icons at top
+            gm_pos = self._find_general_merchant(timeout=8)
 
             if gm_pos is None:
                 self._log("[Potion] General Merchant not found! Abort — biarkan TP handle.")
@@ -3837,6 +3833,67 @@ class L2MAutoKeyApp:
             self._potion_low_count = 0
             self._potion_last_check = time.time()
             self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
+
+    def _find_general_merchant(self, timeout: int = 8):
+        """Find and return click position for General Merchant in NPC list.
+
+        Uses TM_CCOEFF_NORMED (shape matching, NO mask) to avoid false matches
+        on skill icons. RGBA mask + TM_CCORR_NORMED was matching wrong areas.
+        Search restricted to NPC list region (left 20%, y 15-55%).
+        """
+        tpl_path = os.path.join("assets", "general_merchant_btn.png")
+        if not os.path.exists(tpl_path):
+            self._log("[Potion] general_merchant_btn.png not found!")
+            return None
+
+        tpl_bgr, _ = load_image(tpl_path)  # Ignore mask
+        th, tw = tpl_bgr.shape[:2]
+
+        start = time.time()
+        while (time.time() - start) < timeout:
+            time.sleep(1)
+            img = self.capturer.capture()
+            if img is None:
+                continue
+
+            w, h = img.size
+            # NPC list: left side only, below HP bar
+            rx1 = 0
+            ry1 = int(h * 0.15)
+            rx2 = int(w * 0.22)
+            ry2 = int(h * 0.55)
+            search_bgr = cv2.cvtColor(
+                np.array(img.crop((rx1, ry1, rx2, ry2))), cv2.COLOR_RGB2BGR)
+            sh, sw = search_bgr.shape[:2]
+
+            base_scale = h / 720.0
+            best_val = 0
+            best_loc = None
+            best_tw, best_th = tw, th
+
+            for scale_adj in [1.0, 0.9, 1.1, 0.85, 1.15]:
+                s = base_scale * scale_adj
+                nw = max(1, int(tw * s))
+                nh = max(1, int(th * s))
+                if nw >= sw or nh >= sh:
+                    continue
+                adj_tpl = cv2.resize(tpl_bgr, (nw, nh))
+                # Use CCOEFF (shape match) — NO mask to avoid false matches
+                result = cv2.matchTemplate(search_bgr, adj_tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val_s, _, max_loc_s = cv2.minMaxLoc(result)
+
+                if max_val_s > best_val:
+                    best_val = max_val_s
+                    best_loc = max_loc_s
+                    best_tw, best_th = nw, nh
+
+            if best_val >= 0.40 and best_loc is not None:
+                cx = rx1 + best_loc[0] + best_tw // 2
+                cy = ry1 + best_loc[1] + best_th // 2
+                self._log(f"[Potion] General Merchant found (score={best_val:.2f}) at ({cx},{cy})")
+                return (cx, cy)
+
+        return None
 
     def _wait_for_template_in_region(self, template_name: str, timeout: int = 15,
                                         threshold: float = 0.7,
