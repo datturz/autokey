@@ -67,11 +67,8 @@ class TabFarming:
         ce_row0 = ttk.Frame(ce_frame)
         ce_row0.pack(fill=tk.X, pady=2)
         self.combat_escape_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ce_row0, text="Aktifkan Combat Escape",
+        ttk.Checkbutton(ce_row0, text="Aktifkan Combat Escape (Deteksi Icon Combat)",
                         variable=self.combat_escape_enabled).pack(side=tk.LEFT)
-        self.ce_icon_backup = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ce_row0, text="Backup: Deteksi Icon Combat",
-                        variable=self.ce_icon_backup).pack(side=tk.LEFT, padx=(15, 0))
 
         ce_row1 = ttk.Frame(ce_frame)
         ce_row1.pack(fill=tk.X, pady=2)
@@ -220,7 +217,6 @@ class TabFarming:
         if settings.get("potion_tp_key"):
             self.potion_tp_key.set(settings["potion_tp_key"])
         self.combat_escape_enabled.set(settings.get("combat_escape_enabled", False))
-        self.ce_icon_backup.set(settings.get("combat_escape_icon_backup", True))
         self.ce_hp_threshold.delete(0, tk.END)
         self.ce_hp_threshold.insert(0, str(settings.get("combat_escape_hp", 50)))
         if settings.get("combat_escape_weapon_key"):
@@ -272,7 +268,6 @@ class TabFarming:
             "potion_check_interval": int(self.potion_check_interval.get() or 5),
             "potion_tp_key": self.potion_tp_key.get(),
             "combat_escape_enabled": self.combat_escape_enabled.get(),
-            "combat_escape_icon_backup": self.ce_icon_backup.get(),
             "combat_escape_hp": int(self.ce_hp_threshold.get() or 50),
             "combat_escape_weapon_key": self.ce_weapon_key.get(),
             "combat_escape_skill_key": self.ce_skill_key.get(),

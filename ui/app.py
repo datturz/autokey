@@ -879,11 +879,9 @@ class L2MAutoKeyApp:
                         and (now - getattr(self, 'last_in_town_time', 0)) > 3):
                     self._check_radar_actions(img)
 
-                if not self.is_in_town and not self.isBlockedByMouseAction:
-                    self._check_combat_escape(hp_pct)
-
-                # 12b. Backup Combat Escape: detect combat icon (darkness = HP invisible)
-                # No _combat_escape_triggered check — selama icon terdeteksi, terus trigger
+                # 12. Combat Escape: detect combat icon (crossed swords)
+                # HP-based CE removed — HP checker unreliable due to visual effects
+                # Combat icon detection is more accurate and consistent
                 if (not self.is_in_town and not self.isBlockedByMouseAction
                         and self._escaped_to_town_at == 0):
                     self._check_combat_icon_escape(img)
@@ -983,17 +981,15 @@ class L2MAutoKeyApp:
         return self._feature_active != ""
 
     def _check_combat_icon_escape(self, img):
-        """Backup Combat Escape: detect combat icon (crossed swords).
+        """Combat Escape: detect combat icon (crossed swords).
 
-        When character is under Darkness debuff, HP bar is invisible.
-        Bot can't calculate HP → normal CE won't trigger.
-        This backup detects the red combat icon on screen and triggers CE.
+        Detects the red crossed-swords icon that appears when character
+        is being attacked. More reliable than HP-based detection which
+        can misread due to visual effects, darkness debuff, etc.
         Selama icon terdeteksi, terus trigger — cooldown pendek (3s).
         """
         settings = self.tab_farming.collect_settings()
         if not settings.get("combat_escape_enabled"):
-            return
-        if not settings.get("combat_escape_icon_backup", True):
             return
         if not self.key_sender:
             return
@@ -1051,7 +1047,7 @@ class L2MAutoKeyApp:
             if best_val < 0.85:
                 return
 
-            self._log(f"[CE-Backup] Combat icon detected! (score={best_val:.3f})")
+            self._log(f"[CE] Combat icon detected! (score={best_val:.3f})")
         except Exception:
             return
 
@@ -1061,82 +1057,17 @@ class L2MAutoKeyApp:
             return
 
         if not self._acquire_feature("combat_escape", timeout=2.0):
-            self._log(f"[CE-Backup] Waiting for {self._feature_active}...")
+            self._log(f"[CE] Waiting for {self._feature_active}...")
             return
 
         self._combat_escape_triggered = True
         self._combat_escape_last_at = now
         self._combat_icon_escape_last_at = now
-        self._log("[CE-Backup] Combat Escape triggered by combat icon!")
+        self._log("[CE] Combat Escape triggered by combat icon!")
         self._save_combat_escape_screenshot("CombatIcon")
 
         try:
             self._do_combat_escape(settings, 0, 0)
-        finally:
-            self._release_feature()
-
-    def _check_combat_escape(self, hp_pct_int: int):
-        """Combat Escape: HP below threshold → skill → cancel → teleport.
-
-        Completely self-contained per trigger. Re-triggers every time HP is
-        below threshold after returning to farm. No stale state.
-
-        Flow:
-        A. Skill ready   → weapon → skill 2x → cancel 2x → TP spam
-        B. Skill cooldown → TP spam immediately (no weapon/skill)
-        C. Skill active   → cancel 2x → TP spam
-        """
-        settings = self.tab_farming.collect_settings()
-        if not settings.get("combat_escape_enabled"):
-            return
-        if not self.key_sender:
-            return
-
-        threshold = settings.get("combat_escape_hp", 50)
-        weapon_key = settings.get("combat_escape_weapon_key", "")
-        skill_key = settings.get("combat_escape_skill_key", "")
-        tp_key = settings.get("combat_escape_teleport_key", "")
-        weapon_back_key = settings.get("combat_escape_weapon_back_key", "")
-        potion_key = settings.get("combat_escape_potion_key", "")
-
-        if not tp_key:
-            return
-
-        # HP above threshold → reset, not needed
-        if hp_pct_int >= threshold:
-            self._combat_escape_triggered = False
-            self._ce_low_hp_count = 0
-            return
-
-        # Block if in town or escaping
-        if self._escaped_to_town_at > 0 or self.is_in_town:
-            return
-
-        # Require 3 consecutive low HP readings to avoid false trigger
-        # HP checker can misread by ~10% due to visual effects
-        self._ce_low_hp_count = getattr(self, '_ce_low_hp_count', 0) + 1
-        if self._ce_low_hp_count < 3:
-            self._log(f"[CE] HP={hp_pct_int}% < {threshold}% (read {self._ce_low_hp_count}/3)")
-            return
-
-        # Cooldown: don't retrigger within 10s of last escape
-        now = time.time()
-        if (now - getattr(self, '_combat_escape_last_at', 0)) < 10:
-            return
-
-        # Acquire feature lock — wait max 2s (combat escape is high priority)
-        if not self._acquire_feature("combat_escape", timeout=2.0):
-            self._log(f"[CE] Waiting for {self._feature_active} to finish...")
-            return
-
-        self._combat_escape_triggered = True
-        self._combat_escape_last_at = now
-        self._ce_low_hp_count = 0
-        self._log(f"Combat Escape! HP={hp_pct_int}% < {threshold}%")
-        self._save_combat_escape_screenshot(f"HP{hp_pct_int}")
-
-        try:
-            self._do_combat_escape(settings, hp_pct_int, threshold)
         finally:
             self._release_feature()
 
