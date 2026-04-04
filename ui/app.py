@@ -3701,17 +3701,14 @@ class L2MAutoKeyApp:
             self._log("[Potion] Cari General Merchant...")
             time.sleep(3)  # Wait for NPC list to load
 
-            gm_pos = None
-            for tpl_name in ["general_merchant_btn.png", "general_merchant.jpg"]:
-                pos = self._wait_for_template_in_region(
-                    tpl_name, timeout=5,
-                    region_y_min=0.05, region_y_max=0.55,
-                    region_x_min=0.0, region_x_max=0.40,
-                    threshold=0.75
-                )
-                if pos is not None:
-                    gm_pos = pos
-                    break
+            # Only use general_merchant_btn.png (194x48, reliable text template)
+            # Small icon templates (16x16) cause miss clicks
+            gm_pos = self._wait_for_template_in_region(
+                "general_merchant_btn.png", timeout=8,
+                region_y_min=0.05, region_y_max=0.55,
+                region_x_min=0.0, region_x_max=0.40,
+                threshold=0.80
+            )
 
             if gm_pos is None:
                 self._log("[Potion] General Merchant not found! Abort — biarkan TP handle.")
