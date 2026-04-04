@@ -1105,10 +1105,18 @@ class L2MAutoKeyApp:
         # HP above threshold → reset, not needed
         if hp_pct_int >= threshold:
             self._combat_escape_triggered = False
+            self._ce_low_hp_count = 0
             return
 
         # Block if in town or escaping
         if self._escaped_to_town_at > 0 or self.is_in_town:
+            return
+
+        # Require 3 consecutive low HP readings to avoid false trigger
+        # HP checker can misread by ~10% due to visual effects
+        self._ce_low_hp_count = getattr(self, '_ce_low_hp_count', 0) + 1
+        if self._ce_low_hp_count < 3:
+            self._log(f"[CE] HP={hp_pct_int}% < {threshold}% (read {self._ce_low_hp_count}/3)")
             return
 
         # Cooldown: don't retrigger within 10s of last escape
@@ -1123,6 +1131,7 @@ class L2MAutoKeyApp:
 
         self._combat_escape_triggered = True
         self._combat_escape_last_at = now
+        self._ce_low_hp_count = 0
         self._log(f"Combat Escape! HP={hp_pct_int}% < {threshold}%")
         self._save_combat_escape_screenshot(f"HP{hp_pct_int}")
 
@@ -3756,74 +3765,47 @@ class L2MAutoKeyApp:
             # 2. Wait for NPC list to appear, find and click General Merchant
             # The NPC list appears on left side (x: 0-40%, y: 5-50%)
             # Scale template to current resolution for accurate matching
+            # 2. Find General Merchant — abort immediately if not found
             shop_opened = False
-            for attempt in range(4):
-                if self.stop_event.is_set():
-                    return
+            self._log("[Potion] Cari General Merchant...")
+            time.sleep(3)  # Wait for NPC list to load
 
-                self._log(f"[Potion] Cari General Merchant... (attempt {attempt+1})")
-
-                # Wait for screen to stabilize after TP
-                if attempt == 0:
-                    time.sleep(3)  # First attempt: wait for NPC list to load
-
-                # Search with multi-scale (resolution adaptive)
-                gm_pos = None
-                best_score = 0
-                for tpl_name in ["general_merchant_btn.png", "general_merchant.jpg"]:
-                    pos = self._wait_for_template_in_region(
-                        tpl_name, timeout=5,
-                        region_y_min=0.05, region_y_max=0.55,
-                        region_x_min=0.0, region_x_max=0.40,
-                        threshold=0.75
-                    )
-                    if pos is not None:
-                        gm_pos = pos
-                        break
-
-                if gm_pos is None:
-                    self._log("[Potion] General Merchant not found!")
-                    time.sleep(2)
-                    continue
-
-                self._log(f"[Potion] Klik General Merchant at ({gm_pos[0]},{gm_pos[1]})...")
-                self.clicker.click(gm_pos[0], gm_pos[1])
-
-                # Wait for character to walk to merchant
-                self._log("[Potion] Tunggu karakter jalan ke merchant...")
-                time.sleep(4)
-
-                # Verify shop opened (inventory tabs visible)
-                self._log("[Potion] Tunggu shop terbuka...")
-                inv_pos = self._wait_for_template_in_region(
-                    "icon_inventory.png", timeout=10,
-                    region_y_min=0.05, region_y_max=0.30,
-                    region_x_min=0.60, region_x_max=1.0
+            gm_pos = None
+            for tpl_name in ["general_merchant_btn.png", "general_merchant.jpg"]:
+                pos = self._wait_for_template_in_region(
+                    tpl_name, timeout=5,
+                    region_y_min=0.05, region_y_max=0.55,
+                    region_x_min=0.0, region_x_max=0.40,
+                    threshold=0.75
                 )
-                if inv_pos is not None:
-                    shop_opened = True
-                    self._log("[Potion] Shop terbuka!")
+                if pos is not None:
+                    gm_pos = pos
                     break
 
-                # Shop didn't open — close any wrong dialog
-                self._log("[Potion] Shop tidak terbuka, recovery...")
-                # Try close button first
-                close_pos = self._wait_for_template_in_region(
-                    "close.jpg", timeout=2, threshold=0.6,
-                    region_y_min=0.0, region_y_max=0.25,
-                    region_x_min=0.45, region_x_max=1.0
-                )
-                if close_pos:
-                    self._log("[Potion] Close dialog...")
-                    self.clicker.click(close_pos[0], close_pos[1])
-                    time.sleep(1)
-                else:
-                    # No dialog visible, press Escape as safety
-                    self.key_sender.send("Escape")
-                    time.sleep(1)
+            if gm_pos is None:
+                self._log("[Potion] General Merchant not found! Abort — biarkan TP handle.")
+                return
+
+            self._log(f"[Potion] Klik General Merchant at ({gm_pos[0]},{gm_pos[1]})...")
+            self.clicker.click(gm_pos[0], gm_pos[1])
+
+            # Wait for character to walk to merchant
+            self._log("[Potion] Tunggu karakter jalan ke merchant...")
+            time.sleep(4)
+
+            # Verify shop opened (inventory tabs visible)
+            self._log("[Potion] Tunggu shop terbuka...")
+            inv_pos = self._wait_for_template_in_region(
+                "icon_inventory.png", timeout=8,
+                region_y_min=0.05, region_y_max=0.30,
+                region_x_min=0.60, region_x_max=1.0
+            )
+            if inv_pos is not None:
+                shop_opened = True
+                self._log("[Potion] Shop terbuka!")
 
             if not shop_opened:
-                self._log("[Potion] Shop gagal terbuka! Abort.")
+                self._log("[Potion] Shop tidak terbuka! Abort — biarkan TP handle.")
                 self.key_sender.send("Escape")
                 time.sleep(0.5)
                 return
