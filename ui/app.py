@@ -3828,15 +3828,15 @@ class L2MAutoKeyApp:
             self.isBlockedByMouseAction = False
             self._potion_buy_active = False
             self._release_feature()
-
-        # Setelah beli selesai, set town state + reset potion counters
-        self.is_in_town = True
-        self.last_in_town_time = time.time()
-        self._escaped_to_town_at = time.time()
-        self.do_auto_hunt = True
-        self._potion_low_count = 0
-        self._potion_last_check = time.time()
-        self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
+            # Always set town state after TP — even on abort
+            # This ensures TP-back-to-farm kicks in
+            self.is_in_town = True
+            self.last_in_town_time = time.time()
+            self._escaped_to_town_at = time.time()
+            self.do_auto_hunt = True
+            self._potion_low_count = 0
+            self._potion_last_check = time.time()
+            self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
 
     def _wait_for_template_in_region(self, template_name: str, timeout: int = 15,
                                         threshold: float = 0.7,
