@@ -3734,8 +3734,6 @@ class L2MAutoKeyApp:
 
             if not shop_opened:
                 self._log("[Potion] Shop tidak terbuka! Abort — biarkan TP handle.")
-                self.key_sender.send("Escape")
-                time.sleep(0.5)
                 return
 
             self._log("[Potion] Shop terbuka!")
