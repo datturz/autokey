@@ -392,14 +392,8 @@ class L2MAutoKeyApp:
         self.status_label.config(text=self.lang.get("status_active", "Status: Aktif"))
         self._log("Bot dimulai")
 
-        # Pre-fetch boss timer data from Supabase
-        try:
-            self._boss_timer = BossTimer()
-            bosses = self._boss_timer.fetch_bosses()
-            self._log(f"[BossTimer] Loaded {len(bosses)} bosses from Supabase")
-        except Exception as e:
-            self._boss_timer = BossTimer()
-            self._log(f"[BossTimer] Fetch failed: {e}")
+        # Boss timer Supabase disabled — usage too high
+        self._boss_timer = None
 
         # Network radar disabled — entity type 4/6 includes ALL players (party, friendly)
         # causing false positives. Need game's radar warning packet decoded first.
@@ -431,7 +425,8 @@ class L2MAutoKeyApp:
         self._start_thread(self._other_tasks, "other_tasks")
 
         # Thread 5: Smart boss hunt (timer-driven)
-        self._start_thread(self._smart_boss_hunt_loop, "smart_boss_hunt")
+        # Smart boss hunt disabled — Supabase usage too high
+        # self._start_thread(self._smart_boss_hunt_loop, "smart_boss_hunt")
 
         # Thread 6: Radar scan
         if settings.get("radar_scan_enabled"):
