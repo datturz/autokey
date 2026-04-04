@@ -3835,19 +3835,14 @@ class L2MAutoKeyApp:
             self._log("[Potion] Di kota — tunggu teleport otomatis ke farm...")
 
     def _find_general_merchant(self, timeout: int = 8):
-        """Find and return click position for General Merchant in NPC list.
+        """Find General Merchant in NPC list using Tesseract OCR.
 
-        Uses TM_CCOEFF_NORMED (shape matching, NO mask) to avoid false matches
-        on skill icons. RGBA mask + TM_CCORR_NORMED was matching wrong areas.
-        Search restricted to NPC list region (left 20%, y 15-55%).
+        Reads text from NPC list region, finds "General" + "Merchant" words
+        on the same line, returns click position. More reliable than template
+        matching which kept clicking wrong NPCs.
         """
-        tpl_path = os.path.join("assets", "general_merchant_btn.png")
-        if not os.path.exists(tpl_path):
-            self._log("[Potion] general_merchant_btn.png not found!")
-            return None
-
-        tpl_bgr, _ = load_image(tpl_path)  # Ignore mask
-        th, tw = tpl_bgr.shape[:2]
+        import pytesseract
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
         start = time.time()
         while (time.time() - start) < timeout:
@@ -3857,40 +3852,53 @@ class L2MAutoKeyApp:
                 continue
 
             w, h = img.size
-            # NPC list: left side only, below HP bar
+            # NPC list: left side, below HP bar
             rx1 = 0
-            ry1 = int(h * 0.15)
+            ry1 = int(h * 0.12)
             rx2 = int(w * 0.22)
             ry2 = int(h * 0.55)
-            search_bgr = cv2.cvtColor(
-                np.array(img.crop((rx1, ry1, rx2, ry2))), cv2.COLOR_RGB2BGR)
-            sh, sw = search_bgr.shape[:2]
+            npc_crop = img.crop((rx1, ry1, rx2, ry2))
 
-            base_scale = h / 720.0
-            best_val = 0
-            best_loc = None
-            best_tw, best_th = tw, th
+            try:
+                # Preprocess: threshold to make white text on dark bg clearer
+                gray = cv2.cvtColor(np.array(npc_crop), cv2.COLOR_RGB2GRAY)
+                _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
+                thresh_pil = Image.fromarray(thresh)
+                data = pytesseract.image_to_data(thresh_pil, output_type=pytesseract.Output.DICT)
+            except Exception:
+                continue
 
-            for scale_adj in [1.0, 0.9, 1.1, 0.85, 1.15]:
-                s = base_scale * scale_adj
-                nw = max(1, int(tw * s))
-                nh = max(1, int(th * s))
-                if nw >= sw or nh >= sh:
+            # Find "General" + "Merchant" on the same line (close Y)
+            general_pos = None
+            merchant_pos = None
+            for i, text in enumerate(data['text']):
+                t = text.strip().lower()
+                if not t or int(data['conf'][i]) < 30:
                     continue
-                adj_tpl = cv2.resize(tpl_bgr, (nw, nh))
-                # Use CCOEFF (shape match) — NO mask to avoid false matches
-                result = cv2.matchTemplate(search_bgr, adj_tpl, cv2.TM_CCOEFF_NORMED)
-                _, max_val_s, _, max_loc_s = cv2.minMaxLoc(result)
+                if 'general' in t or 'neral' in t:
+                    general_pos = (data['left'][i], data['top'][i],
+                                   data['width'][i], data['height'][i])
+                # "Merchant" right after "General" on same line
+                if 'merchant' in t and general_pos is not None:
+                    my = data['top'][i]
+                    gy = general_pos[1]
+                    if abs(my - gy) < 20:
+                        merchant_pos = (data['left'][i], data['top'][i],
+                                        data['width'][i], data['height'][i])
+                        break
+                    else:
+                        general_pos = None  # Different line — skip
 
-                if max_val_s > best_val:
-                    best_val = max_val_s
-                    best_loc = max_loc_s
-                    best_tw, best_th = nw, nh
-
-            if best_val >= 0.40 and best_loc is not None:
-                cx = rx1 + best_loc[0] + best_tw // 2
-                cy = ry1 + best_loc[1] + best_th // 2
-                self._log(f"[Potion] General Merchant found (score={best_val:.2f}) at ({cx},{cy})")
+            if general_pos and merchant_pos:
+                # Click center of "General Merchant" text span
+                x1 = general_pos[0]
+                y1 = min(general_pos[1], merchant_pos[1])
+                x2 = merchant_pos[0] + merchant_pos[2]
+                y2 = max(general_pos[1] + general_pos[3],
+                         merchant_pos[1] + merchant_pos[3])
+                cx = rx1 + (x1 + x2) // 2
+                cy = ry1 + (y1 + y2) // 2
+                self._log(f"[Potion] General Merchant found (OCR) at ({cx},{cy})")
                 return (cx, cy)
 
         return None
