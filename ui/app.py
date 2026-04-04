@@ -3865,7 +3865,8 @@ class L2MAutoKeyApp:
                 # Preprocess: threshold to make white text on dark bg clearer
                 gray = cv2.cvtColor(np.array(npc_crop), cv2.COLOR_RGB2GRAY)
                 _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
-                thresh_pil = Image.fromarray(thresh)
+                from PIL import Image as PILImage
+                thresh_pil = PILImage.fromarray(thresh)
                 data = pytesseract.image_to_data(thresh_pil, output_type=pytesseract.Output.DICT)
                 # Debug: log what OCR reads
                 words = [data['text'][i].strip() for i in range(len(data['text']))
