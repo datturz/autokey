@@ -134,6 +134,10 @@ SHOP_ICON_REGIONS = [
 # Minimap / character position indicator
 HUNTING_MINIMAP = (0.08203125, 0.15555555555555556, 0.125, 0.2361111111111111)
 
+# Full clickable minimap area (circular minimap in top-left)
+# At 1280x720: approx x=34..196, y=62..224
+MINIMAP_FULL_AREA = (0.027, 0.086, 0.153, 0.311)
+
 # Character level/name indicator (top-left corner)
 HUNTING_CHAR_INDICATOR = (0.0265625, 0.011111111111111112, 0.034375, 0.02361111111111111)
 

@@ -42,6 +42,7 @@ AVAILABLE_KEYS = {
     "F9": 120, "F10": 121, "F11": 122, "F12": 123,
 
     # ── Letters ──
+    "W": 87, "A": 65, "S": 83, "D": 68,
     "F": 70, "Q": 81, "R": 82, "E": 69, "T": 84,
     "O": 79, "P": 80, "M": 77, "N": 78,
     "U": 85, "H": 72, "X": 88,
@@ -87,6 +88,36 @@ class KeySender:
             print(f"[KeySender] Sent '{char}' OK")
         except Exception as e:
             print(f"[KeySender] send error for '{char}': {e}")
+
+    def send_down(self, char: str):
+        """Send key DOWN (press without release). For WASD hold."""
+        char = char.strip()
+        if not char:
+            return
+        vk_code = self._char_to_vk(char)
+        if vk_code is None:
+            return
+        scan_code = win32api.MapVirtualKey(vk_code, 0)
+        lparam_down = 1 | (scan_code << 16)
+        try:
+            win32api.PostMessage(self.hwnd, win32con.WM_KEYDOWN, vk_code, lparam_down)
+        except Exception:
+            pass
+
+    def send_up(self, char: str):
+        """Send key UP (release). For WASD hold."""
+        char = char.strip()
+        if not char:
+            return
+        vk_code = self._char_to_vk(char)
+        if vk_code is None:
+            return
+        scan_code = win32api.MapVirtualKey(vk_code, 0)
+        lparam_up = 1 | (scan_code << 16) | 0xC0000000
+        try:
+            win32api.PostMessage(self.hwnd, win32con.WM_KEYUP, vk_code, lparam_up)
+        except Exception:
+            pass
 
     def send_force(self, char: str):
         """Send keystroke without condition checks (same as original sendKeyForce)."""

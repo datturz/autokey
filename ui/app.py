@@ -62,6 +62,7 @@ from ui.tab_radar import TabRadar
 from ui.tab_weapon import TabWeapon
 from ui.tab_farming import TabFarming
 from ui.tab_daily import TabDaily
+from ui.tab_dungeon import TabDungeon
 
 __version__ = "1.1.0"
 
@@ -231,6 +232,9 @@ class L2MAutoKeyApp:
         self.notebook.add(tab3_frame, text=self.lang.get("tab_weapon", "Ganti Senjata"))
         self.notebook.add(tab4_frame, text=self.lang.get("tab_farming", "Farming"))
         self.notebook.add(tab5_frame, text=self.lang.get("tab_daily", "Harian"))
+        # Dungeon tab — WIP, hidden until testing complete
+        # tab6_frame = ttk.Frame(self.notebook, padding=5)
+        # self.notebook.add(tab6_frame, text="Dungeon")
 
         self.tab_main = TabMain(tab1_frame, self.lang)
         self.tab_radar = TabRadar(tab2_frame, self.lang)
@@ -239,6 +243,8 @@ class L2MAutoKeyApp:
         self.tab_farming._test_tp_callback = self._test_teleport_now
         self.tab_farming._save_screenshot_callback = self._save_debug_screenshot
         self.tab_daily = TabDaily(tab5_frame, self.lang)
+        # self.tab_dungeon = TabDungeon(tab6_frame, self.lang)
+        self.tab_dungeon = None
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -295,6 +301,8 @@ class L2MAutoKeyApp:
         self.tab_weapon.apply_settings(settings)
         self.tab_farming.apply_settings(settings)
         self.tab_daily.apply_settings(settings)
+        if self.tab_dungeon:
+            self.tab_dungeon.apply_settings(settings)
 
     def _collect_all_settings(self) -> dict:
         settings = {}
@@ -303,6 +311,8 @@ class L2MAutoKeyApp:
         settings.update(self.tab_weapon.collect_settings())
         settings.update(self.tab_farming.collect_settings())
         settings.update(self.tab_daily.collect_settings())
+        if self.tab_dungeon:
+            settings.update(self.tab_dungeon.collect_settings())
         return settings
 
     # ──────────────────────────────────────────────
@@ -431,6 +441,18 @@ class L2MAutoKeyApp:
         # Thread 6: Radar scan
         if settings.get("radar_scan_enabled"):
             self._start_thread(self._radar_key_spam_loop, "radar_key_spam")
+
+        # Wire dungeon tab refs (WIP — hidden until testing complete)
+        # if self.tab_dungeon:
+        #     self.tab_dungeon.set_bot_refs(
+        #         capturer=self.capturer, clicker=self.clicker,
+        #         key_sender=self.key_sender, stop_event=self.stop_event,
+        #         acquire_feature=self._acquire_feature,
+        #         release_feature=self._release_feature,
+        #         check_interrupted=lambda: self.is_in_town or self._escaped_to_town_at > 0,
+        #         log_callback=self._log,
+        #         hwnd=self.capturer.hwnd if self.capturer else None,
+        #     )
 
     def _start_thread(self, target, name, args=()):
         t = threading.Thread(target=target, args=args, daemon=True, name=name)
