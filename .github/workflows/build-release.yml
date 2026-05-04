@@ -26,14 +26,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller pywin32 opencv-python-headless numpy Pillow mss supabase python-dotenv httpx
 
-      - name: Create .env file
-        run: |
-          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
-          echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> .env
-
       - name: Build Windows executable
         run: |
-          python -m PyInstaller --onefile --windowed --name L2M_AutoKey --add-data "assets;assets" --add-data ".env;." --add-data "lang.json;." --hidden-import supabase --hidden-import dotenv --hidden-import postgrest --hidden-import gotrue --hidden-import realtime --hidden-import storage3 --hidden-import supafunc --hidden-import httpx --hidden-import win32gui --hidden-import win32con --hidden-import win32api --hidden-import win32process --hidden-import pywintypes --hidden-import cv2 --hidden-import mss --hidden-import PIL --hidden-import numpy main.py
+          python -m PyInstaller --onefile --windowed --name L2M_AutoKey --add-data "assets;assets" --add-data "lang.json;." --hidden-import supabase --hidden-import postgrest --hidden-import gotrue --hidden-import realtime --hidden-import storage3 --hidden-import supafunc --hidden-import httpx --hidden-import win32gui --hidden-import win32con --hidden-import win32api --hidden-import win32process --hidden-import pywintypes --hidden-import cv2 --hidden-import mss --hidden-import PIL --hidden-import numpy main.py
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
