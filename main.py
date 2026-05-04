@@ -1,13 +1,21 @@
 """L2M AutoKey - Lineage 2M Automation Tool.
 
 Must be run as Administrator for keystroke sending to work.
-PIN validation via Supabase before launch.
+License validation (1 PC = 1 Code) via Supabase before launch.
 
 Usage: python main.py
 """
 import sys
 import os
 import ctypes
+import hashlib
+import uuid
+import json
+
+
+# ── Supabase config (autokey project) ──
+SUPABASE_URL = "https://fpccqibibfsqefziavqj.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwY2NxaWJpYmZzcWVmemlhdnFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzMTUzNDgsImV4cCI6MjA4ODg5MTM0OH0.PVYyilHJ4VyLdExjhkbPNT4Z8HidV5JPHrNkCDWerL8"
 
 
 def get_resource_path(relative_path):
@@ -27,7 +35,6 @@ def is_admin() -> bool:
 def run_as_admin():
     """Re-launch this script with administrator privileges."""
     if hasattr(sys, '_MEIPASS'):
-        # Running as exe
         ret = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, "", None, 1
         )
@@ -40,81 +47,235 @@ def run_as_admin():
     return ret > 32
 
 
-def validate_pin() -> bool:
-    """Show PIN dialog and validate against Supabase."""
-    import tkinter as tk
-    from tkinter import ttk, messagebox
-
+def get_hwid() -> str:
+    """Generate hardware ID from machine-specific identifiers.
+    Combines: machine UUID + MAC address → SHA256 → 16 char hex.
+    """
     try:
-        from dotenv import load_dotenv
-        env_path = get_resource_path('.env')
-        if os.path.exists(env_path):
-            load_dotenv(env_path)
-        else:
-            load_dotenv()
-    except ImportError:
+        import subprocess
+        # Get machine UUID from BIOS (unique per motherboard)
+        r = subprocess.run(
+            ['wmic', 'csproduct', 'get', 'UUID'],
+            capture_output=True, text=True, timeout=5
+        )
+        machine_uuid = r.stdout.strip().split('\n')[-1].strip()
+    except Exception:
+        machine_uuid = "unknown"
+
+    # MAC address
+    mac = hex(uuid.getnode())
+
+    raw = f"{machine_uuid}:{mac}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
+
+
+def _get_license_cache_path() -> str:
+    """Path to cached license code (next to exe or in project root)."""
+    if hasattr(sys, '_MEIPASS'):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, ".license")
+
+
+def _load_cached_code() -> str:
+    """Load previously entered code from cache file."""
+    path = _get_license_cache_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                return data.get("code", "")
+    except Exception:
+        pass
+    return ""
+
+
+def _save_cached_code(code: str):
+    """Save code to cache file so user doesn't re-enter every time."""
+    path = _get_license_cache_path()
+    try:
+        with open(path, 'w') as f:
+            json.dump({"code": code}, f)
+    except Exception:
         pass
 
-    supabase_url = os.getenv("SUPABASE_URL", "")
-    supabase_key = os.getenv("SUPABASE_KEY", "")
 
-    if not supabase_url or not supabase_key:
-        messagebox.showerror("Error", "Konfigurasi server tidak ditemukan.")
-        return False
+def _check_license_silent(code: str, hwid: str) -> tuple[bool, str]:
+    """Check license against Supabase without UI. Returns (valid, message)."""
+    from datetime import datetime, timezone
+    if not code:
+        return False, "No code"
+    try:
+        from supabase import create_client
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        resp = client.table("licenses").select("*").eq("code", code).execute()
+        if not resp.data:
+            return False, "Code tidak valid"
+        lic = resp.data[0]
+        if not lic.get("is_active", False):
+            return False, "Code dinonaktifkan"
+        expires_str = lic.get("expires_at", "")
+        if expires_str:
+            try:
+                expires = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) > expires:
+                    return False, "Code sudah expired"
+            except Exception:
+                pass
+        stored_hwid = lic.get("hwid", "")
+        if stored_hwid and stored_hwid != hwid:
+            return False, "Code sudah dipakai di PC lain"
+        if not stored_hwid:
+            client.table("licenses").update({
+                "hwid": hwid,
+                "activated_at": datetime.now(timezone.utc).isoformat()
+            }).eq("code", code).execute()
+        return True, "Valid"
+    except Exception as e:
+        return False, f"Koneksi gagal: {e}"
+
+
+def validate_license() -> bool:
+    """Validate license — auto-check cached code first, show dialog only if needed."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    from datetime import datetime, timezone
+
+    hwid = get_hwid()
+    cached_code = _load_cached_code()
+
+    # Auto-validate cached code (skip dialog if still valid)
+    if cached_code:
+        valid, msg = _check_license_silent(cached_code, hwid)
+        if valid:
+            print(f"[License] Auto-validated: {cached_code}")
+            return True
+        else:
+            print(f"[License] Cached code failed: {msg}")
 
     result = {"valid": False}
 
-    def on_submit(event=None):
-        pin = pin_entry.get().strip()
-        if not pin:
-            status_label.config(text="Masukkan PIN!", foreground="red")
-            return
+    def do_validate(code: str, status_label, dialog):
+        """Validate code against Supabase."""
+        if not code:
+            status_label.config(text="Masukkan code!", foreground="red")
+            return False
 
         status_label.config(text="Memvalidasi...", foreground="gray")
         dialog.update()
 
         try:
             from supabase import create_client
-            client = create_client(supabase_url, supabase_key)
-            resp = client.table("pin_validation").select("pin").eq("pin", pin).execute()
-            if resp.data and len(resp.data) > 0:
-                result["valid"] = True
-                dialog.destroy()
-            else:
-                status_label.config(text="PIN salah!", foreground="red")
-                pin_entry.delete(0, tk.END)
-                pin_entry.focus()
+            client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            resp = client.table("licenses").select("*").eq("code", code).execute()
+
+            if not resp.data or len(resp.data) == 0:
+                status_label.config(text="Code tidak valid!", foreground="red")
+                return False
+
+            license_data = resp.data[0]
+
+            # Check is_active
+            if not license_data.get("is_active", False):
+                status_label.config(text="Code dinonaktifkan!", foreground="red")
+                return False
+
+            # Check expiry
+            expires_str = license_data.get("expires_at", "")
+            if expires_str:
+                try:
+                    expires = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+                    if datetime.now(timezone.utc) > expires:
+                        status_label.config(text="Code sudah expired!", foreground="red")
+                        return False
+                except Exception:
+                    pass
+
+            # Check HWID
+            stored_hwid = license_data.get("hwid", "")
+
+            if not stored_hwid:
+                # First activation — bind to this PC
+                try:
+                    client.table("licenses").update({
+                        "hwid": hwid,
+                        "activated_at": datetime.now(timezone.utc).isoformat()
+                    }).eq("code", code).execute()
+                    status_label.config(text="Aktivasi berhasil!", foreground="green")
+                except Exception as e:
+                    status_label.config(text=f"Gagal aktivasi: {e}", foreground="red")
+                    return False
+            elif stored_hwid != hwid:
+                # Different PC
+                status_label.config(text="Code sudah dipakai di PC lain!", foreground="red")
+                return False
+
+            # Valid!
+            _save_cached_code(code)
+            return True
+
         except Exception as e:
             status_label.config(text=f"Koneksi gagal: {e}", foreground="red")
+            return False
+
+    def on_submit(event=None):
+        code = code_entry.get().strip().upper()
+        if do_validate(code, status_label, dialog):
+            result["valid"] = True
+            dialog.destroy()
 
     def on_close():
         result["valid"] = False
         dialog.destroy()
 
+    # ── Build dialog ──
     dialog = tk.Tk()
-    dialog.title("L2M AutoKey - Login")
-    dialog.geometry("350x180")
+    dialog.title("L2M AutoKey - Aktivasi")
+    dialog.geometry("420x250")
     dialog.resizable(False, False)
     dialog.protocol("WM_DELETE_WINDOW", on_close)
 
-    # Center on screen
     dialog.update_idletasks()
-    x = (dialog.winfo_screenwidth() - 350) // 2
-    y = (dialog.winfo_screenheight() - 180) // 2
-    dialog.geometry(f"350x180+{x}+{y}")
+    x = (dialog.winfo_screenwidth() - 420) // 2
+    y = (dialog.winfo_screenheight() - 250) // 2
+    dialog.geometry(f"420x250+{x}+{y}")
 
     frame = ttk.Frame(dialog, padding=20)
     frame.pack(fill=tk.BOTH, expand=True)
 
-    ttk.Label(frame, text="L2M AutoKey", font=("Segoe UI", 14, "bold")).pack(pady=(0, 10))
-    ttk.Label(frame, text="Masukkan PIN:").pack(anchor=tk.W)
+    ttk.Label(frame, text="L2M AutoKey", font=("Segoe UI", 14, "bold")).pack(pady=(0, 5))
 
-    pin_entry = ttk.Entry(frame, show="*", width=30, font=("Segoe UI", 12))
-    pin_entry.pack(pady=5, fill=tk.X)
-    pin_entry.bind("<Return>", on_submit)
-    pin_entry.focus()
+    # Show HWID
+    hwid_frame = ttk.Frame(frame)
+    hwid_frame.pack(fill=tk.X, pady=(0, 8))
+    ttk.Label(hwid_frame, text="Hardware ID:", foreground="gray").pack(side=tk.LEFT)
+    hwid_entry = ttk.Entry(hwid_frame, font=("Consolas", 10), width=20)
+    hwid_entry.pack(side=tk.LEFT, padx=5)
+    hwid_entry.insert(0, hwid)
+    hwid_entry.config(state="readonly")
 
-    ttk.Button(frame, text="Login", command=on_submit).pack(pady=5)
+    def copy_hwid():
+        dialog.clipboard_clear()
+        dialog.clipboard_append(hwid)
+        copy_btn.config(text="Copied!")
+        dialog.after(1500, lambda: copy_btn.config(text="Copy"))
+
+    copy_btn = ttk.Button(hwid_frame, text="Copy", command=copy_hwid, width=6)
+    copy_btn.pack(side=tk.LEFT)
+
+    # Code input
+    ttk.Label(frame, text="Masukkan License Code:").pack(anchor=tk.W)
+    code_entry = ttk.Entry(frame, width=30, font=("Consolas", 12))
+    code_entry.pack(pady=5, fill=tk.X)
+    code_entry.bind("<Return>", on_submit)
+
+    # Pre-fill cached code
+    if cached_code:
+        code_entry.insert(0, cached_code)
+    code_entry.focus()
+
+    ttk.Button(frame, text="Aktivasi", command=on_submit).pack(pady=5)
 
     status_label = ttk.Label(frame, text="", foreground="gray")
     status_label.pack()
@@ -139,11 +300,11 @@ def main():
             input("Tekan Enter untuk keluar...")
             sys.exit(1)
 
-    # PIN validation
-    if not validate_pin():
+    # License validation
+    if not validate_license():
         sys.exit(0)
 
-    # We are admin + PIN valid
+    # We are admin + license valid
     import tkinter as tk
     from tkinter import ttk
 

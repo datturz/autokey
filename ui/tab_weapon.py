@@ -30,6 +30,9 @@ class TabWeapon:
         ttk.Label(row1, text=self.lang.get("weapon_key2", "Tombol 2:")).pack(side=tk.LEFT, padx=(20, 0))
         self.key2 = ttk.Combobox(row1, values=KEY_LIST, width=6, state="readonly")
         self.key2.pack(side=tk.LEFT, padx=5)
+        ttk.Label(row1, text="Tombol 3:").pack(side=tk.LEFT, padx=(20, 0))
+        self.key3 = ttk.Combobox(row1, values=KEY_LIST, width=6, state="readonly")
+        self.key3.pack(side=tk.LEFT, padx=5)
 
         row2 = ttk.Frame(frame)
         row2.pack(fill=tk.X, pady=2)
@@ -83,6 +86,8 @@ class TabWeapon:
             self.key1.set(settings["weapon_key1"])
         if settings.get("weapon_key2"):
             self.key2.set(settings["weapon_key2"])
+        if settings.get("weapon_key3"):
+            self.key3.set(settings["weapon_key3"])
         self.delay.delete(0, tk.END)
         self.delay.insert(0, str(settings.get("weapon_switch_delay", 1.0)))
         self.interval.delete(0, tk.END)
@@ -94,6 +99,7 @@ class TabWeapon:
             "weapon_switch_enabled": self.enabled.get(),
             "weapon_key1": self.key1.get(),
             "weapon_key2": self.key2.get(),
+            "weapon_key3": self.key3.get(),
             "weapon_switch_delay": float(self.delay.get() or 1.0),
             "weapon_switch_interval": int(self.interval.get() or 60),
             "weapon_press_space": self.press_space.get(),

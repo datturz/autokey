@@ -1536,6 +1536,7 @@ class L2MAutoKeyApp:
             delay = settings.get("weapon_switch_delay", 1.0)
             key1 = settings.get("weapon_key1", "")
             key2 = settings.get("weapon_key2", "")
+            key3 = settings.get("weapon_key3", "")
 
             if not key1 or not self.key_sender:
                 self.stop_event.wait(1)
@@ -1582,7 +1583,6 @@ class L2MAutoKeyApp:
 
             if key2:
                 self.stop_event.wait(delay)
-                # Re-check: abort key2 if combat escape triggered during delay
                 if self.stop_event.is_set():
                     self._release_feature()
                     break
@@ -1592,6 +1592,18 @@ class L2MAutoKeyApp:
                     continue
                 self._log(f"Ganti senjata kembali: {key2}")
                 self.key_sender.send(key2)
+
+            if key3:
+                self.stop_event.wait(delay)
+                if self.stop_event.is_set():
+                    self._release_feature()
+                    break
+                if self._combat_escape_triggered or self._escaped_to_town_at > 0:
+                    self._log(f"Ganti senjata 3 SKIP (combat escape aktif)")
+                    self._release_feature()
+                    continue
+                self._log(f"Ganti senjata 3: {key3}")
+                self.key_sender.send(key3)
 
             self._release_feature()
 
