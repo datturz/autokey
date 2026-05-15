@@ -327,7 +327,12 @@ def main():
     style.configure("TLabelframe", padding=5)
 
     from ui.app import L2MAutoKeyApp
+    from updater import schedule_periodic_check
     app = L2MAutoKeyApp(root)
+
+    # Check for updates on startup (once per 24h) + schedule recurring check
+    schedule_periodic_check(root)
+
     root.mainloop()
 
 

@@ -64,7 +64,7 @@ from ui.tab_farming import TabFarming
 from ui.tab_daily import TabDaily
 from ui.tab_dungeon import TabDungeon
 
-__version__ = "1.1.0"
+from version import APP_VERSION as __version__
 
 
 class L2MAutoKeyApp:
@@ -242,6 +242,7 @@ class L2MAutoKeyApp:
         self.tab_farming = TabFarming(tab4_frame, self.lang)
         self.tab_farming._test_tp_callback = self._test_teleport_now
         self.tab_farming._save_screenshot_callback = self._save_debug_screenshot
+        self.tab_farming._test_skill_region_callback = self._test_skill_region_now
         self.tab_daily = TabDaily(tab5_frame, self.lang)
         # self.tab_dungeon = TabDungeon(tab6_frame, self.lang)
         self.tab_dungeon = None
@@ -1011,8 +1012,17 @@ class L2MAutoKeyApp:
         if not self.key_sender:
             return
 
-        # Short cooldown — agresif selama icon masih terdeteksi
         now = time.time()
+
+        # Long cooldown: prevent re-trigger right after a successful CE (in town,
+        # before transition-out reset fires). _combat_escape_last_at is cleared to 0
+        # when bot properly transitions out of town (line ~860), so this cooldown
+        # only blocks false-positive triggers during/right after the previous CE.
+        last_ce = getattr(self, '_combat_escape_last_at', 0)
+        if last_ce > 0 and (now - last_ce) < 60:
+            return
+
+        # Short cooldown — agresif selama icon masih terdeteksi
         if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 3:
             return
 
@@ -1107,16 +1117,120 @@ class L2MAutoKeyApp:
         except Exception:
             pass
 
+    def _load_skill_ssim_templates(self):
+        """Load skill_active.png and skill_grayed.png as grayscale templates."""
+        if hasattr(self, '_skill_ssim_loaded') and self._skill_ssim_loaded:
+            return
+        self._skill_ssim_loaded = True
+        self._skill_active_gray = None
+        self._skill_grayed_gray = None
+        for name, attr in [("skill_active.png", "_skill_active_gray"),
+                           ("skill_grayed.png", "_skill_grayed_gray")]:
+            path = os.path.join("assets", name)
+            if os.path.exists(path):
+                try:
+                    bgr, _ = load_image(path)
+                    setattr(self, attr, cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+                except Exception:
+                    pass
+
+    def _is_skill_grayed(self, slot_num: int, img=None) -> bool:
+        """Detect if skill slot icon is grayed out (frozen by enemy debuff).
+
+        Uses SSIM (Structural Similarity Index) against active/grayed templates.
+        SSIM compares structure/luminance/contrast — robust to brightness shifts
+        and background noise. Score 0.0-1.0; the template with higher score wins.
+        """
+        from skimage.metrics import structural_similarity as ssim
+
+        if img is None:
+            if not self.capturer:
+                return False
+            img = self.capturer.capture()
+            if img is None:
+                return False
+
+        # Get configured region from CE settings
+        try:
+            ce_settings = self.tab_farming.collect_settings()
+            x1_pct = float(ce_settings.get("combat_escape_skill_x1", 70.6))
+            y1_pct = float(ce_settings.get("combat_escape_skill_y1", 92.5))
+            x2_pct = float(ce_settings.get("combat_escape_skill_x2", 74.1))
+            y2_pct = float(ce_settings.get("combat_escape_skill_y2", 98.6))
+        except Exception:
+            x1_pct, y1_pct, x2_pct, y2_pct = 70.6, 92.5, 74.1, 98.6
+
+        w, h = img.size
+        sx1 = max(0, int(w * x1_pct / 100.0))
+        sy1 = max(0, int(h * y1_pct / 100.0))
+        sx2 = min(w, int(w * x2_pct / 100.0))
+        sy2 = min(h, int(h * y2_pct / 100.0))
+        if sx2 <= sx1 or sy2 <= sy1:
+            return False
+
+        self._load_skill_ssim_templates()
+        if self._skill_active_gray is None or self._skill_grayed_gray is None:
+            print("[CE/Freeze] Templates not loaded, fallback grayed=False")
+            return False
+
+        try:
+            crop = img.crop((sx1, sy1, sx2, sy2))
+            crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+            crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            # Resize crop separately for each template — templates may have
+            # different dimensions; SSIM requires matching shapes per-call.
+            ah, aw = self._skill_active_gray.shape[:2]
+            gh, gw = self._skill_grayed_gray.shape[:2]
+            crop_a = cv2.resize(crop_gray, (aw, ah), interpolation=cv2.INTER_AREA)
+            crop_g = cv2.resize(crop_gray, (gw, gh), interpolation=cv2.INTER_AREA)
+            score_active = float(ssim(crop_a, self._skill_active_gray, data_range=255))
+            score_grayed = float(ssim(crop_g, self._skill_grayed_gray, data_range=255))
+        except Exception as e:
+            print(f"[CE/Freeze] SSIM error: {e}")
+            return False
+
+        is_grayed = score_grayed > score_active
+
+        # Save debug screenshot: on state transition OR every ~2s
+        last_state = getattr(self, '_last_skill_grayed_state', None)
+        last_save = getattr(self, '_last_skill_save_ts', 0)
+        now_ts = time.time()
+        should_save = (last_state is None
+                       or last_state != is_grayed
+                       or (now_ts - last_save) >= 2.0)
+        if should_save:
+            try:
+                if hasattr(sys, '_MEIPASS'):
+                    base = os.path.dirname(sys.executable)
+                else:
+                    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                log_dir = os.path.join(base, "skill_state_logs")
+                os.makedirs(log_dir, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                state_str = "GRAYED" if is_grayed else "ACTIVE"
+                fname = f"{ts}_slot{slot_num}_{state_str}_A{score_active:.2f}_G{score_grayed:.2f}.png"
+                crop.save(os.path.join(log_dir, fname))
+                self._last_skill_save_ts = now_ts
+            except Exception:
+                pass
+        self._last_skill_grayed_state = is_grayed
+
+        try:
+            print(f"[CE/Freeze] Slot {slot_num} SSIM active={score_active:.3f} grayed={score_grayed:.3f} → grayed={is_grayed}")
+        except Exception:
+            pass
+        return is_grayed
+
     def _do_combat_escape(self, settings, hp_pct_int, threshold):
         """Internal combat escape — simple reliable flow:
 
         1. Weapon switch
+        1.5. Wait while skill slot grayed (enemy freeze debuff, max 15s)
         2. Skill 2x (activate: SELF popup + confirm)
         3. Wait 1.5s (skill becomes active = stun immune)
         4. Skill 2x (cancel)
         5. TP spam (immediately after cancel, no gap)
 
-        No state detection — always full sequence.
         If skill is on cooldown, presses do nothing (safe).
         """
         weapon_key = settings.get("combat_escape_weapon_key", "")
@@ -1124,6 +1238,7 @@ class L2MAutoKeyApp:
         tp_key = settings.get("combat_escape_teleport_key", "")
         weapon_back_key = settings.get("combat_escape_weapon_back_key", "")
         potion_key = settings.get("combat_escape_potion_key", "")
+        skill_slot = settings.get("combat_escape_skill_slot", 4)
 
         # Step 1: Weapon switch
         if weapon_key:
@@ -1131,22 +1246,52 @@ class L2MAutoKeyApp:
             self.key_sender.send(weapon_key)
             time.sleep(0.3)
 
-        # Step 2: Skill 2x (press → 0.05s → press)
+        # Step 2: Check skill state immediately after weapon switch.
+        # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
+        # If never becomes usable within timeout, skip skill entirely — just TP.
         if skill_key:
-            self._log(f"[CE] Skill 2x")
-            self.key_sender.send(skill_key)
-            time.sleep(0.05)
-            self.key_sender.send(skill_key)
+            # Reset state tracker so first check of this CE always saves screenshot
+            self._last_skill_grayed_state = None
+            self._last_skill_save_ts = 0
+            freeze_start = time.time()
+            FREEZE_TIMEOUT = 15.0  # shortened — if freeze lasts >15s, skill likely lost
+            waiting_logged = False
+            skill_cast_done = False
 
-            # Step 3: Wait 1s (skill active = stun immune)
-            time.sleep(1.0)
+            while (time.time() - freeze_start) < FREEZE_TIMEOUT:
+                if self.stop_event.is_set():
+                    return
+                if self._is_skill_grayed(skill_slot):
+                    if not waiting_logged:
+                        self._log(f"[CE] Skill slot {skill_slot} grayed → di-freeze musuh, menunggu (max {FREEZE_TIMEOUT:.0f}s)...")
+                        waiting_logged = True
+                    time.sleep(0.03)
+                    continue
+                # Active — cast immediately
+                if waiting_logged:
+                    self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s, Skill 2x")
+                else:
+                    self._log(f"[CE] Skill 2x")
+                self.key_sender.send(skill_key)
+                time.sleep(0.05)
+                self.key_sender.send(skill_key)
+                skill_cast_done = True
+                break
 
-            # Step 4: Cancel 2x BURST + TP BURST — zero gap
-            self._log(f"[CE] Cancel+TP")
-            self.key_sender.send(skill_key)
-            self.key_sender.send(skill_key)
-            for _ in range(10):
-                self.key_sender.send(tp_key)
+            if skill_cast_done:
+                # Step 3: Wait 1s (skill active = stun immune)
+                time.sleep(1.0)
+                # Step 4: Cancel 2x + TP BURST — zero gap
+                self._log(f"[CE] Cancel+TP")
+                self.key_sender.send(skill_key)
+                self.key_sender.send(skill_key)
+                for _ in range(10):
+                    self.key_sender.send(tp_key)
+            else:
+                # Skill never fired (frozen too long) — skip skill, just TP
+                self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill, TP only")
+                for _ in range(10):
+                    self.key_sender.send(tp_key)
         else:
             for _ in range(10):
                 self.key_sender.send(tp_key)
@@ -2105,126 +2250,24 @@ class L2MAutoKeyApp:
                 self._teleport_to_spot(settings, rotate=True)
                 self.last_auto_tp_at = now
 
-    def _load_autohunt_templates(self):
-        """Load autohunt on/off templates (once)."""
-        if hasattr(self, '_ah_templates_loaded') and self._ah_templates_loaded:
-            return
-        self._ah_templates_loaded = True
-        self._autohunt_on_tpl = None
-        self._autohunt_off_tpl = None
-        for name, attr in [("autohunt_on.png", "_autohunt_on_tpl"),
-                           ("autohunt_off.png", "_autohunt_off_tpl")]:
-            path = os.path.join("assets", name)
-            if os.path.exists(path):
-                try:
-                    bgr, mask = load_image(path)
-                    setattr(self, attr, (bgr, mask))
-                except Exception:
-                    pass
-
-    def _is_autohunt_on(self, img=None) -> bool | None:
-        """Cek apakah auto hunt sedang ON via template matching.
-
-        Match autohunt_on.png dan autohunt_off.png di area kanan layar.
-        Returns: True=ON, False=OFF, None=tidak bisa detect.
-        """
-        self._load_autohunt_templates()
-        if img is None:
-            if not self.capturer:
-                return None
-            img = self.capturer.capture()
-            if img is None:
-                return None
-
-        w, h = img.size
-        # Auto hunt icon di kanan layar (75-100% width, 30-65% height)
-        rx1 = int(w * 0.75)
-        ry1 = int(h * 0.30)
-        rx2 = w
-        ry2 = int(h * 0.65)
-        crop = img.crop((rx1, ry1, rx2, ry2))
-        crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
-        ch, cw = crop_bgr.shape[:2]
-        scale = h / 720.0
-
-        on_score = 0.0
-        off_score = 0.0
-
-        # Check ON template
-        if self._autohunt_on_tpl is not None:
-            tpl_bgr, tpl_mask = self._autohunt_on_tpl
-            th, tw = tpl_bgr.shape[:2]
-            s_tpl, s_mask = tpl_bgr, tpl_mask
-            if abs(scale - 1.0) > 0.05:
-                nw = max(1, int(tw * scale))
-                nh = max(1, int(th * scale))
-                if nw < cw and nh < ch:
-                    s_tpl = cv2.resize(tpl_bgr, (nw, nh))
-                    s_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
-            sth, stw = s_tpl.shape[:2]
-            if sth <= ch and stw <= cw:
-                if s_mask is not None:
-                    result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
-                else:
-                    result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCOEFF_NORMED)
-                _, on_score, _, _ = cv2.minMaxLoc(result)
-
-        # Check OFF template
-        if self._autohunt_off_tpl is not None:
-            tpl_bgr, tpl_mask = self._autohunt_off_tpl
-            th, tw = tpl_bgr.shape[:2]
-            s_tpl, s_mask = tpl_bgr, tpl_mask
-            if abs(scale - 1.0) > 0.05:
-                nw = max(1, int(tw * scale))
-                nh = max(1, int(th * scale))
-                if nw < cw and nh < ch:
-                    s_tpl = cv2.resize(tpl_bgr, (nw, nh))
-                    s_mask = cv2.resize(tpl_mask, (nw, nh)) if tpl_mask is not None else None
-            sth, stw = s_tpl.shape[:2]
-            if sth <= ch and stw <= cw:
-                if s_mask is not None:
-                    result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCORR_NORMED, mask=s_mask)
-                else:
-                    result = cv2.matchTemplate(crop_bgr, s_tpl, cv2.TM_CCOEFF_NORMED)
-                _, off_score, _, _ = cv2.minMaxLoc(result)
-
-        try:
-            print(f"[AutoHunt] ON={on_score:.3f} OFF={off_score:.3f}")
-        except Exception:
-            pass
-
-        # Return yang score tertinggi (min 0.6)
-        if on_score >= 0.6 and on_score > off_score:
-            return True
-        if off_score >= 0.6 and off_score > on_score:
-            return False
-        return None
-
     def _start_auto_hunt(self):
-        """Restart auto hunt — HANYA jika autohunt OFF (template match).
-        Tidak fire jika ON atau unknown.
+        """Restart auto hunt — langsung tekan key (no image check).
         Cooldown 30s antara attempts.
         """
         if not self.key_sender:
             return
-        # Cooldown
         now = time.time()
         last_attempt = getattr(self, '_autohunt_last_attempt', 0)
         if (now - last_attempt) < 30:
             return
         self._autohunt_last_attempt = now
-        # Cek apakah sudah ON via template
-        is_on = self._is_autohunt_on()
-        if is_on is True:
-            self._log("Auto hunt sudah ON, skip")
-            self.do_auto_hunt = False
+        settings = self.tab_farming.collect_settings()
+        autohunt_key = settings.get("teleport_autohunt_key", "")
+        if not autohunt_key:
+            self._log("Auto hunt: key belum di-set, skip")
             return
-        if is_on is False:
-            self._log("Auto hunt OFF → tekan F")
-            self.key_sender.send("F")
-            return
-        # Unknown → skip, jangan spam
-        self._log("Auto hunt: tidak bisa detect, skip")
+        self._log(f"Auto hunt → tekan {autohunt_key}")
+        self.key_sender.send(autohunt_key)
 
     # ──────────────────────────────────────────────
     #  Boss / Zariche check (original Tab5 flow)
@@ -4205,30 +4248,25 @@ class L2MAutoKeyApp:
         self._log(f"[TP] Teleport ke spot {index}, menunggu stabil...")
 
         # ── Step 8: pressing_key_after_teleporting() ──
-        key_after = settings.get("teleport_key_after", "")
-        self._pressing_key_after_teleporting(key_after)
+        cancel_key = settings.get("teleport_cancel_attack_key", "")
+        autohunt_key = settings.get("teleport_autohunt_key", "")
+        self._pressing_key_after_teleporting(cancel_key, autohunt_key)
 
-    def _pressing_key_after_teleporting(self, key_after: str = ""):
-        """Tunggu loading teleport selesai lalu press key jika autohunt OFF."""
+    def _pressing_key_after_teleporting(self, cancel_key: str = "", autohunt_key: str = ""):
+        """Setelah teleport selesai: cancel attack lalu start auto hunt."""
         time.sleep(5.0)  # tunggu loading map selesai
 
-        key = key_after if key_after else "F"
-
-        # Cek autohunt status — hanya tekan jika OFF
-        is_on = self._is_autohunt_on()
-        if is_on is True:
-            self._log(f"[TP] Auto hunt sudah ON, skip tekan {key}")
+        if not self.key_sender:
             return
 
-        if is_on is False:
-            self._log(f"[TP] Auto hunt OFF, tekan {key}")
-            if self.key_sender:
-                self.key_sender.send(key)
-        else:
-            # Unknown — tekan sekali saja sebagai safety
-            self._log(f"[TP] Tekan {key} (1x)")
-            if self.key_sender:
-                self.key_sender.send(key)
+        if cancel_key:
+            self._log(f"[TP] Cancel attack: tekan {cancel_key}")
+            self.key_sender.send(cancel_key)
+            time.sleep(0.5)
+
+        if autohunt_key:
+            self._log(f"[TP] Auto hunt: tekan {autohunt_key}")
+            self.key_sender.send(autohunt_key)
 
     # ──────────────────────────────────────────────
     #  Daily tasks loop (boss, zariche, etc.)
@@ -4328,6 +4366,49 @@ class L2MAutoKeyApp:
         settings = self._collect_all_settings()
         self._log("=== TEST TELEPORT ===")
         self._teleport_to_spot(settings)
+
+    def _test_skill_region_now(self):
+        """Capture current screen, crop using configured CE skill region, save & open."""
+        if not self._ensure_modules():
+            self._log("Error: pilih window dulu!")
+            return
+        try:
+            img = self.capturer.capture() if self.capturer else None
+            if img is None:
+                self._log("[Test Region] Gagal capture screen")
+                return
+            ce = self.tab_farming.collect_settings()
+            x1_pct = float(ce.get("combat_escape_skill_x1", 70.6))
+            y1_pct = float(ce.get("combat_escape_skill_y1", 92.5))
+            x2_pct = float(ce.get("combat_escape_skill_x2", 74.1))
+            y2_pct = float(ce.get("combat_escape_skill_y2", 98.6))
+            w, h = img.size
+            sx1 = max(0, int(w * x1_pct / 100.0))
+            sy1 = max(0, int(h * y1_pct / 100.0))
+            sx2 = min(w, int(w * x2_pct / 100.0))
+            sy2 = min(h, int(h * y2_pct / 100.0))
+            if sx2 <= sx1 or sy2 <= sy1:
+                self._log(f"[Test Region] Region invalid: ({sx1},{sy1})-({sx2},{sy2})")
+                return
+            crop = img.crop((sx1, sy1, sx2, sy2))
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            out_dir = os.path.join(base, "skill_state_logs")
+            os.makedirs(out_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(out_dir, f"TEST_REGION_{ts}_{sx1}_{sy1}_{sx2}_{sy2}.png")
+            crop.save(out_path)
+            msg = f"Region ({x1_pct:.1f},{y1_pct:.1f})-({x2_pct:.1f},{y2_pct:.1f}) → {sx2-sx1}×{sy2-sy1}px"
+            self._log(f"[Test Region] {msg} saved: {out_path}")
+            try:
+                self.tab_farming.ce_region_status.config(text=f"Saved: {os.path.basename(out_path)}")
+            except Exception:
+                pass
+            try:
+                os.startfile(out_path)
+            except Exception:
+                pass
+        except Exception as e:
+            self._log(f"[Test Region] Error: {e}")
 
     def _on_close(self):
         if self.is_running:

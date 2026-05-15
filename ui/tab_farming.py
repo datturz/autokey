@@ -53,12 +53,19 @@ class TabFarming:
         self.tp_during_farm_min.insert(0, "30")
         ttk.Label(farm_frame, text=self.lang.get("minutes", "menit")).pack(side=tk.LEFT)
 
-        # Key after teleport
-        key_frame = ttk.Frame(tp_frame)
-        key_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(key_frame, text="Tekan tombol setelah teleport:").pack(side=tk.LEFT)
-        self.tp_key_after = ttk.Combobox(key_frame, values=[""] + KEY_LIST, width=6, state="readonly")
-        self.tp_key_after.pack(side=tk.LEFT, padx=5)
+        # Cancel attack key (pressed first after teleport to clear pending target)
+        ca_frame = ttk.Frame(tp_frame)
+        ca_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(ca_frame, text="Tombol Cancel Attack:").pack(side=tk.LEFT)
+        self.tp_cancel_attack_key = ttk.Combobox(ca_frame, values=[""] + KEY_LIST, width=6, state="readonly")
+        self.tp_cancel_attack_key.pack(side=tk.LEFT, padx=5)
+
+        # Auto hunt key (pressed after cancel attack)
+        ah_frame = ttk.Frame(tp_frame)
+        ah_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(ah_frame, text="Tombol Auto Hunt:").pack(side=tk.LEFT)
+        self.tp_autohunt_key = ttk.Combobox(ah_frame, values=[""] + KEY_LIST, width=6, state="readonly")
+        self.tp_autohunt_key.pack(side=tk.LEFT, padx=5)
 
         # Combat Escape — auto sequence when under attack
         ce_frame = ttk.LabelFrame(self.parent, text="Combat Escape", padding=10)
@@ -92,6 +99,43 @@ class TabFarming:
         self.ce_skill_slot = ttk.Combobox(ce_row3, values=["1","2","3","4","5","6","7","8"], width=3, state="readonly")
         self.ce_skill_slot.pack(side=tk.LEFT, padx=5)
         self.ce_skill_slot.set("4")
+
+        # Skill icon region (% of screen) for freeze-detection — resolution-independent
+        ce_region_label = ttk.Frame(ce_frame)
+        ce_region_label.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(ce_region_label, text="Region icon skill (%): X1, Y1 → X2, Y2",
+                  foreground="gray").pack(side=tk.LEFT)
+
+        ce_region_row = ttk.Frame(ce_frame)
+        ce_region_row.pack(fill=tk.X, pady=2)
+        ttk.Label(ce_region_row, text="X1:").pack(side=tk.LEFT)
+        self.ce_skill_x1 = ttk.Entry(ce_region_row, width=6)
+        self.ce_skill_x1.pack(side=tk.LEFT, padx=2)
+        self.ce_skill_x1.insert(0, "53.7")
+        ttk.Label(ce_region_row, text="Y1:").pack(side=tk.LEFT, padx=(8, 0))
+        self.ce_skill_y1 = ttk.Entry(ce_region_row, width=6)
+        self.ce_skill_y1.pack(side=tk.LEFT, padx=2)
+        self.ce_skill_y1.insert(0, "84.2")
+        ttk.Label(ce_region_row, text="X2:").pack(side=tk.LEFT, padx=(8, 0))
+        self.ce_skill_x2 = ttk.Entry(ce_region_row, width=6)
+        self.ce_skill_x2.pack(side=tk.LEFT, padx=2)
+        self.ce_skill_x2.insert(0, "58.9")
+        ttk.Label(ce_region_row, text="Y2:").pack(side=tk.LEFT, padx=(8, 0))
+        self.ce_skill_y2 = ttk.Entry(ce_region_row, width=6)
+        self.ce_skill_y2.pack(side=tk.LEFT, padx=2)
+        self.ce_skill_y2.insert(0, "92.6")
+
+        # Test region button — capture & open the cropped region for verification
+        ce_test_row = ttk.Frame(ce_frame)
+        ce_test_row.pack(fill=tk.X, pady=2)
+        self.btn_test_skill_region = ttk.Button(
+            ce_test_row, text="Test Region — capture & buka crop",
+            command=self._on_test_skill_region,
+        )
+        self.btn_test_skill_region.pack(side=tk.LEFT, padx=2)
+        self._test_skill_region_callback = None
+        self.ce_region_status = ttk.Label(ce_test_row, text="", foreground="gray")
+        self.ce_region_status.pack(side=tk.LEFT, padx=8)
 
         ce_row4 = ttk.Frame(ce_frame)
         ce_row4.pack(fill=tk.X, pady=2)
@@ -203,8 +247,10 @@ class TabFarming:
         self.tp_during_farm.set(settings.get("teleport_during_farm_enabled", False))
         self.tp_during_farm_min.delete(0, tk.END)
         self.tp_during_farm_min.insert(0, str(settings.get("teleport_during_farm_minutes", 30)))
-        if settings.get("teleport_key_after"):
-            self.tp_key_after.set(settings["teleport_key_after"])
+        if settings.get("teleport_cancel_attack_key"):
+            self.tp_cancel_attack_key.set(settings["teleport_cancel_attack_key"])
+        if settings.get("teleport_autohunt_key"):
+            self.tp_autohunt_key.set(settings["teleport_autohunt_key"])
         self.auto_letter.set(settings.get("auto_check_letter", False))
         self.auto_letter_min.delete(0, tk.END)
         self.auto_letter_min.insert(0, str(settings.get("auto_check_letter_minutes", 30)))
@@ -230,6 +276,18 @@ class TabFarming:
             self.ce_weapon_back_key.set(settings["combat_escape_weapon_back_key"])
         if settings.get("combat_escape_potion_key"):
             self.ce_potion_key.set(settings["combat_escape_potion_key"])
+        if "combat_escape_skill_x1" in settings:
+            self.ce_skill_x1.delete(0, tk.END)
+            self.ce_skill_x1.insert(0, str(settings["combat_escape_skill_x1"]))
+        if "combat_escape_skill_y1" in settings:
+            self.ce_skill_y1.delete(0, tk.END)
+            self.ce_skill_y1.insert(0, str(settings["combat_escape_skill_y1"]))
+        if "combat_escape_skill_x2" in settings:
+            self.ce_skill_x2.delete(0, tk.END)
+            self.ce_skill_x2.insert(0, str(settings["combat_escape_skill_x2"]))
+        if "combat_escape_skill_y2" in settings:
+            self.ce_skill_y2.delete(0, tk.END)
+            self.ce_skill_y2.insert(0, str(settings["combat_escape_skill_y2"]))
 
     def _on_save_screenshot(self):
         """Save debug screenshot with grid overlay."""
@@ -241,6 +299,12 @@ class TabFarming:
         if self._test_tp_callback:
             import threading
             threading.Thread(target=self._test_tp_callback, daemon=True).start()
+
+    def _on_test_skill_region(self):
+        """Capture current screen, crop using configured region, save & open."""
+        if self._test_skill_region_callback:
+            import threading
+            threading.Thread(target=self._test_skill_region_callback, daemon=True).start()
 
     def get_pin_position(self) -> tuple[float, float]:
         """Get pin icon normalized position from UI."""
@@ -259,7 +323,8 @@ class TabFarming:
             "teleport_after_town_minutes": float(self.tp_after_town_min.get() or 5),
             "teleport_during_farm_enabled": self.tp_during_farm.get(),
             "teleport_during_farm_minutes": float(self.tp_during_farm_min.get() or 30),
-            "teleport_key_after": self.tp_key_after.get(),
+            "teleport_cancel_attack_key": self.tp_cancel_attack_key.get(),
+            "teleport_autohunt_key": self.tp_autohunt_key.get(),
             "auto_check_letter": self.auto_letter.get(),
             "auto_check_letter_minutes": int(self.auto_letter_min.get() or 30),
             "auto_buy_items": self.auto_buy.get(),
@@ -275,4 +340,8 @@ class TabFarming:
             "combat_escape_teleport_key": self.ce_teleport_key.get(),
             "combat_escape_weapon_back_key": self.ce_weapon_back_key.get(),
             "combat_escape_potion_key": self.ce_potion_key.get(),
+            "combat_escape_skill_x1": float(self.ce_skill_x1.get() or 70.6),
+            "combat_escape_skill_y1": float(self.ce_skill_y1.get() or 92.5),
+            "combat_escape_skill_x2": float(self.ce_skill_x2.get() or 74.1),
+            "combat_escape_skill_y2": float(self.ce_skill_y2.get() or 98.6),
         }
