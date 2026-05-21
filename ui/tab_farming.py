@@ -125,17 +125,17 @@ class TabFarming:
         self.ce_skill_y2.pack(side=tk.LEFT, padx=2)
         self.ce_skill_y2.insert(0, "92.6")
 
-        # Test region button — capture & open the cropped region for verification
-        ce_test_row = ttk.Frame(ce_frame)
-        ce_test_row.pack(fill=tk.X, pady=2)
-        self.btn_test_skill_region = ttk.Button(
-            ce_test_row, text="Test Region — capture & buka crop",
-            command=self._on_test_skill_region,
-        )
-        self.btn_test_skill_region.pack(side=tk.LEFT, padx=2)
+        # Test region button DISABLED — commented out for release
+        # ce_test_row = ttk.Frame(ce_frame)
+        # ce_test_row.pack(fill=tk.X, pady=2)
+        # self.btn_test_skill_region = ttk.Button(
+        #     ce_test_row, text="Test Region — capture & buka crop",
+        #     command=self._on_test_skill_region,
+        # )
+        # self.btn_test_skill_region.pack(side=tk.LEFT, padx=2)
+        # self.ce_region_status = ttk.Label(ce_test_row, text="", foreground="gray")
+        # self.ce_region_status.pack(side=tk.LEFT, padx=8)
         self._test_skill_region_callback = None
-        self.ce_region_status = ttk.Label(ce_test_row, text="", foreground="gray")
-        self.ce_region_status.pack(side=tk.LEFT, padx=8)
 
         ce_row4 = ttk.Frame(ce_frame)
         ce_row4.pack(fill=tk.X, pady=2)
@@ -154,6 +154,20 @@ class TabFarming:
         ttk.Label(ce_row6, text="5. Potion di kota:").pack(side=tk.LEFT)
         self.ce_potion_key = ttk.Combobox(ce_row6, values=[""] + KEY_LIST, width=6, state="readonly")
         self.ce_potion_key.pack(side=tk.LEFT, padx=5)
+
+        # Death limit — auto-stop bot after N deaths
+        death_frame = ttk.LabelFrame(self.parent, text="Death Limit", padding=10)
+        death_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        death_row = ttk.Frame(death_frame)
+        death_row.pack(fill=tk.X, pady=2)
+        self.death_limit_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(death_row, text="Auto stop bot setelah mati",
+                        variable=self.death_limit_enabled).pack(side=tk.LEFT)
+        self.death_limit_count = ttk.Entry(death_row, width=4)
+        self.death_limit_count.pack(side=tk.LEFT, padx=5)
+        self.death_limit_count.insert(0, "2")
+        ttk.Label(death_row, text="kali (counter reset saat Start)").pack(side=tk.LEFT)
 
         # Other farming options
         other_frame = ttk.LabelFrame(self.parent, text="Opsi Farming Lainnya", padding=10)
@@ -276,6 +290,10 @@ class TabFarming:
             self.ce_weapon_back_key.set(settings["combat_escape_weapon_back_key"])
         if settings.get("combat_escape_potion_key"):
             self.ce_potion_key.set(settings["combat_escape_potion_key"])
+        self.death_limit_enabled.set(settings.get("death_limit_enabled", True))
+        if "death_limit_count" in settings:
+            self.death_limit_count.delete(0, tk.END)
+            self.death_limit_count.insert(0, str(settings["death_limit_count"]))
         if "combat_escape_skill_x1" in settings:
             self.ce_skill_x1.delete(0, tk.END)
             self.ce_skill_x1.insert(0, str(settings["combat_escape_skill_x1"]))
@@ -340,6 +358,8 @@ class TabFarming:
             "combat_escape_teleport_key": self.ce_teleport_key.get(),
             "combat_escape_weapon_back_key": self.ce_weapon_back_key.get(),
             "combat_escape_potion_key": self.ce_potion_key.get(),
+            "death_limit_enabled": self.death_limit_enabled.get(),
+            "death_limit_count": int(self.death_limit_count.get() or 2),
             "combat_escape_skill_x1": float(self.ce_skill_x1.get() or 70.6),
             "combat_escape_skill_y1": float(self.ce_skill_y1.get() or 92.5),
             "combat_escape_skill_x2": float(self.ce_skill_x2.get() or 74.1),

@@ -36,6 +36,7 @@ from core.boss_timer import BossTimer
 from core.net_radar import NetRadar
 from core.image_utils import load_image, match_template
 from core.hunting import HuntingChecker
+# from core.emblem_detector import EmblemDetector  # DISABLED — feature commented out
 try:
     from core.sound_detector import SoundDetector, HAS_AUDIO
 except ImportError:
@@ -91,6 +92,11 @@ class L2MAutoKeyApp:
         self.clicker: MouseClicker | None = None
         self.hp_checker = HPChecker()
         self.hunting_checker = HuntingChecker()
+        # Emblem detector DISABLED — feature commented out
+        # self.emblem_detector = EmblemDetector(
+        #     assets_dir=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+        # )
+        self.emblem_detector = None
         # Sound-based radar detection
         self.sound_detector = None
         if HAS_AUDIO and SoundDetector:
@@ -238,6 +244,7 @@ class L2MAutoKeyApp:
 
         self.tab_main = TabMain(tab1_frame, self.lang)
         self.tab_radar = TabRadar(tab2_frame, self.lang)
+        # self.tab_radar.set_emblem_reload_callback(self.emblem_detector.reload)  # DISABLED
         self.tab_weapon = TabWeapon(tab3_frame, self.lang)
         self.tab_farming = TabFarming(tab4_frame, self.lang)
         self.tab_farming._test_tp_callback = self._test_teleport_now
@@ -391,6 +398,12 @@ class L2MAutoKeyApp:
         self._last_img_for_checks = None  # Cache latest image for other threads
         self._combat_escape_triggered = False  # Combat escape already fired this cycle
         self._combat_escape_last_at = 0.0  # Timestamp of last combat escape
+        self._death_count = 0  # Reset death counter per session
+        self._last_death_at = 0.0  # Cooldown timestamp for death dedup
+        self._radar_templates_cache = None  # Lazy-cached radar templates
+        self._radar_warn_template_cache = None  # Lazy-cached warn_icon
+        self._emblem_last_check_at = 0.0  # Throttle emblem detection
+        self._emblem_last_trigger_at = 0.0  # Emblem escape cooldown
 
         # Feature lock — prevents race conditions between features
         # Only ONE feature can run at a time (weapon switch, boss check, combat escape, etc.)
@@ -459,6 +472,19 @@ class L2MAutoKeyApp:
         t = threading.Thread(target=target, args=args, daemon=True, name=name)
         t.start()
         self.threads.append(t)
+
+    def _on_death_limit_reached(self, count: int):
+        """Called on main thread when death count exceeds limit — stop + popup."""
+        self.stop_all()
+        try:
+            messagebox.showwarning(
+                "Death Limit Reached",
+                f"Karakter sudah mati sebanyak {count} kali.\n\n"
+                f"Bot dihentikan otomatis untuk mencegah kehilangan exp/equipment.\n\n"
+                f"Cek posisi farming atau lawan, lalu Start ulang manual.",
+            )
+        except Exception:
+            pass
 
     def stop_all(self):
         self.stop_event.set()
@@ -763,8 +789,14 @@ class L2MAutoKeyApp:
 
                 now = time.time()
 
-                # RADAR detection moved to _check_radar_actions (line ~888)
-                # Uses warning_1280.png + radar_1_/radar_3_ from original AutoKeyL2M v2.7
+                # PRIORITY: Combat icon check FIRST (HP critical — every ms matters).
+                # Moved from end of loop to here so it doesn't wait for HP/town/
+                # emblem/radar checks (~100-150ms cumulative) to finish first.
+                # The actual _check_combat_icon_escape internally checks all the
+                # required gates (town state, blocked state, cooldowns).
+                if (not self.is_in_town and not self.isBlockedByMouseAction
+                        and self._escaped_to_town_at == 0):
+                    self._check_combat_icon_escape(img)
 
                 # 2. Check saved spots dialog every frame
                 dialog_open = self._is_saved_spots_dialog_open(img)
@@ -772,13 +804,26 @@ class L2MAutoKeyApp:
                 # 3. Check screen stability every frame
                 self._is_stable = self.capturer.is_stable_an_hue_icon(img)
 
-                # 7. Death detection → click resurrection (640, 600) @1280x720
-                # Original: tab4.nhan_hoi_sinh() → clicker.click(640, 600)
+                # 7. Death detection → count + click resurrection + check limit
                 try:
                     if self.hunting_checker.is_dead(img):
-                        self._log("Dead! Klik resurrection (640,600)...")
+                        now_d = time.time()
+                        # Cooldown 60s — death dialog persists for several frames,
+                        # don't count the same event multiple times
+                        if (now_d - self._last_death_at) > 60:
+                            self._death_count += 1
+                            self._last_death_at = now_d
+                            ce_settings = self.tab_farming.collect_settings()
+                            limit_enabled = ce_settings.get("death_limit_enabled", True)
+                            limit_count = ce_settings.get("death_limit_count", 2)
+                            self._log(f"[DEATH] Mati ke-{self._death_count} (limit={limit_count}, enabled={limit_enabled})")
+                            if limit_enabled and self._death_count >= limit_count:
+                                self._log(f"[DEATH] Mencapai limit {limit_count}x — STOP BOT")
+                                self.root.after(0, self._on_death_limit_reached, self._death_count)
+                                return  # Exit screen loop immediately
+                        self._log("Dead! Klik Resurrect at Village (640,525)...")
                         if self.clicker:
-                            self.clicker.click_scaled(640, 600)
+                            self.clicker.click_scaled(640, 525)
                             time.sleep(2.0)
                 except Exception:
                     pass
@@ -892,24 +937,31 @@ class L2MAutoKeyApp:
                 # Radar detects enemy → escape. If radar fails → combat escape handles HP drop.
                 # Both run independently, both can trigger escape.
                 # Only blocked when already in town or already escaped.
+                # Emblem detection runs EVERY iteration regardless of town/HUD state.
+                # _is_stable gate was tried but is unreliable in zones with
+                # color overlays (green-tinted Fields of Massacre, etc.) where
+                # the an_hue HUD icon stability check fails during normal gameplay.
+                # Menu false-positives are filtered downstream via red-color
+                # verification on warn_icon match location.
+                # self._check_emblem_detection(img, now)  # DISABLED
+
+                # Radar check gated only on town state — no _is_stable gate.
                 if (not self.is_in_town
                         and self._escaped_to_town_at == 0
                         and (now - getattr(self, 'last_in_town_time', 0)) > 3):
-                    self._check_radar_actions(img)
+                    if self._escaped_to_town_at > 0:
+                        pass
+                    else:
+                        self._check_radar_actions(img)
 
-                # 12. Combat Escape: detect combat icon (crossed swords)
-                # HP-based CE removed — HP checker unreliable due to visual effects
-                # Combat icon detection is more accurate and consistent
-                if (not self.is_in_town and not self.isBlockedByMouseAction
-                        and self._escaped_to_town_at == 0):
-                    self._check_combat_icon_escape(img)
+                # (Combat icon detection moved to TOP of loop for minimum latency)
 
                 # 10. HP-based actions (skip saat map terbuka)
                 if not self.isBlockedByMouseAction:
                     self._check_hp_actions(hp_pct / 100.0)
 
-                # 13. sleep 0.3
-                self.stop_event.wait(0.3)
+                # 13. sleep 0.1 — minimal latency for combat icon / CE / radar detection
+                self.stop_event.wait(0.1)
 
             except Exception as e:
                 print(f"[ScreenCapture] error: {e}")
@@ -1002,9 +1054,8 @@ class L2MAutoKeyApp:
         """Combat Escape: detect combat icon (crossed swords).
 
         Detects the red crossed-swords icon that appears when character
-        is being attacked. More reliable than HP-based detection which
-        can misread due to visual effects, darkness debuff, etc.
-        Selama icon terdeteksi, terus trigger — cooldown pendek (3s).
+        is being attacked. Uses CACHED pre-resized templates for minimum
+        detection latency — every ms matters here, character HP is dropping.
         """
         settings = self.tab_farming.collect_settings()
         if not settings.get("combat_escape_enabled"):
@@ -1014,62 +1065,67 @@ class L2MAutoKeyApp:
 
         now = time.time()
 
-        # Long cooldown: prevent re-trigger right after a successful CE (in town,
-        # before transition-out reset fires). _combat_escape_last_at is cleared to 0
-        # when bot properly transitions out of town (line ~860), so this cooldown
-        # only blocks false-positive triggers during/right after the previous CE.
+        # Long cooldown: prevent re-trigger right after a successful CE
         last_ce = getattr(self, '_combat_escape_last_at', 0)
         if last_ce > 0 and (now - last_ce) < 60:
             return
 
-        # Short cooldown — agresif selama icon masih terdeteksi
-        if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 3:
+        # Short cooldown — faster re-detection (was 3s)
+        if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 1:
             return
 
-        # Search for combat icon ONLY to the RIGHT of X button
-        # Farming sword icon (left of X) has similar red color — must exclude it
-        # Combat icon appears right of X button near edge: ~(0.85, 0.60) to (1.0, 0.82)
+        # Lazy-cache combat icon template at all scales (eliminates per-call disk I/O
+        # and resize — was ~30-50ms overhead per main loop iteration).
+        if not getattr(self, '_combat_icon_cache_loaded', False):
+            self._combat_icon_cache_loaded = True
+            self._combat_icon_cache = []  # list of (nh, nw, gray)
+            combat_icon_path = os.path.join("assets", "combat_icon.png")
+            if not os.path.exists(combat_icon_path):
+                self._log("[CE] combat_icon.png not found, detection disabled")
+                return
+            try:
+                tpl_bgr, _ = load_image(combat_icon_path)
+                tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+                # Reduced scale set — common ones only (was 9 scales, now 5)
+                for scale in (0.625, 0.8, 1.0, 1.25, 1.5):
+                    th, tw = tpl_gray.shape[:2]
+                    nw = max(10, int(tw * scale))
+                    nh = max(10, int(th * scale))
+                    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+                    self._combat_icon_cache.append(
+                        (nh, nw, cv2.resize(tpl_gray, (nw, nh), interpolation=interp))
+                    )
+                self._log(f"[CE] cached {len(self._combat_icon_cache)} combat icon scales")
+            except Exception as e:
+                self._log(f"[CE] template cache error: {e}")
+                return
+
+        if not self._combat_icon_cache:
+            return
+
+        # Crop right-side region where combat icon appears
         w, h = img.size
         rx1 = int(w * 0.85)
         ry1 = int(h * 0.60)
-        rx2 = w  # all the way to right edge
+        rx2 = w
         ry2 = int(h * 0.82)
-
         cropped = img.crop((rx1, ry1, rx2, ry2))
-        crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
+        crop_arr = np.array(cropped)
+        crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
+        sh, sw = crop_gray.shape[:2]
 
-        # Step 1: Grayscale SHAPE matching (not color-based)
-        # Red mask approach fails: spell effects flood region with red → false positive
-        # Grayscale TM_CCOEFF_NORMED matches the crossed-sword SHAPE reliably
-        combat_icon_path = os.path.join("assets", "combat_icon.png")
-        if not os.path.exists(combat_icon_path):
-            return
-
+        # Fast path: try scales until one matches; break early
+        best_val = 0
         try:
-            template_bgr_orig, _ = load_image(combat_icon_path)
-            crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-            tmpl_gray_orig = cv2.cvtColor(template_bgr_orig, cv2.COLOR_BGR2GRAY)
-            sh, sw = crop_gray.shape[:2]
-
-            # Multi-scale: template from 1280x720, scale to current resolution
-            scales = [0.5, 0.625, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
-            best_val = 0
-
-            for scale in scales:
-                th_orig, tw_orig = tmpl_gray_orig.shape[:2]
-                new_w = max(10, int(tw_orig * scale))
-                new_h = max(10, int(th_orig * scale))
-                if new_h > sh or new_w > sw:
+            for nh, nw, tpl_gray in self._combat_icon_cache:
+                if nh > sh or nw > sw:
                     continue
-
-                tmpl_gray = cv2.resize(tmpl_gray_orig, (new_w, new_h),
-                                       interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-
-                result = cv2.matchTemplate(crop_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                result = cv2.matchTemplate(crop_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
                 _, max_val_s, _, _ = cv2.minMaxLoc(result)
-
                 if max_val_s > best_val:
                     best_val = max_val_s
+                    if best_val >= 0.92:
+                        break  # very high confidence, skip remaining scales
 
             if best_val < 0.85:
                 return
@@ -1177,19 +1233,53 @@ class L2MAutoKeyApp:
             crop = img.crop((sx1, sy1, sx2, sy2))
             crop_bgr = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
             crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-            # Resize crop separately for each template — templates may have
-            # different dimensions; SSIM requires matching shapes per-call.
             ah, aw = self._skill_active_gray.shape[:2]
             gh, gw = self._skill_grayed_gray.shape[:2]
             crop_a = cv2.resize(crop_gray, (aw, ah), interpolation=cv2.INTER_AREA)
             crop_g = cv2.resize(crop_gray, (gw, gh), interpolation=cv2.INTER_AREA)
+            # SSIM kept for diagnostic only
             score_active = float(ssim(crop_a, self._skill_active_gray, data_range=255))
             score_grayed = float(ssim(crop_g, self._skill_grayed_gray, data_range=255))
+            # PIXEL-WISE MEAN ABSOLUTE DIFFERENCE (MAD) — primary signal
+            # Computes |crop - template| at each pixel, averages.
+            # Lower MAD = closer pixel-by-pixel match = use that template.
+            # More robust than brightness-only because it captures FULL spatial
+            # pattern (shield highlight positions, dim areas, etc.) not just
+            # average brightness which scene lighting can fool.
+            diff_active = float(np.mean(np.abs(
+                crop_a.astype(np.int16) - self._skill_active_gray.astype(np.int16))))
+            diff_grayed = float(np.mean(np.abs(
+                crop_g.astype(np.int16) - self._skill_grayed_gray.astype(np.int16))))
         except Exception as e:
-            print(f"[CE/Freeze] SSIM error: {e}")
+            print(f"[CE/Freeze] check error: {e}")
             return False
 
-        is_grayed = score_grayed > score_active
+        # Decision: which template has LOWER pixel difference (better match)
+        # If crop pixels match grayed template better → skill is frozen → wait
+        is_grayed_raw = diff_grayed < diff_active
+
+        # HYSTERESIS: in dark scenes (Darkness debuff), MAD/SSIM values become
+        # noisy and frame-by-frame classification can flip-flop. To prevent
+        # premature cast when skill is actually still grayed, require 2
+        # consecutive "active" reads before clearing the grayed state.
+        # Transition TO grayed is immediate (be cautious — don't cast on noise).
+        last_state = getattr(self, '_last_skill_grayed_state', None)
+        if last_state is True and not is_grayed_raw:
+            # Was grayed, now reads active — need consecutive confirmation
+            consec = getattr(self, '_consecutive_active_reads', 0) + 1
+            self._consecutive_active_reads = consec
+            if consec < 2:
+                # Not yet confirmed — keep grayed to be safe
+                is_grayed = True
+            else:
+                # 2 consecutive active reads → confirmed clear
+                is_grayed = False
+                self._consecutive_active_reads = 0
+        else:
+            is_grayed = is_grayed_raw
+            if is_grayed_raw:
+                # Reset counter when grayed (so any future active needs 2 consec)
+                self._consecutive_active_reads = 0
 
         # Save debug screenshot: on state transition OR every ~2s
         last_state = getattr(self, '_last_skill_grayed_state', None)
@@ -1216,7 +1306,8 @@ class L2MAutoKeyApp:
         self._last_skill_grayed_state = is_grayed
 
         try:
-            print(f"[CE/Freeze] Slot {slot_num} SSIM active={score_active:.3f} grayed={score_grayed:.3f} → grayed={is_grayed}")
+            print(f"[CE/Freeze] Slot {slot_num} MAD active={diff_active:.1f} grayed={diff_grayed:.1f} "
+                  f"(SSIM a={score_active:.3f} g={score_grayed:.3f}) → grayed={is_grayed}")
         except Exception:
             pass
         return is_grayed
@@ -1244,7 +1335,7 @@ class L2MAutoKeyApp:
         if weapon_key:
             self._log(f"[CE] Weapon: {weapon_key}")
             self.key_sender.send(weapon_key)
-            time.sleep(0.3)
+            time.sleep(0.1)  # reduced from 0.3s — game UI update is fast
 
         # Step 2: Check skill state immediately after weapon switch.
         # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
@@ -1254,7 +1345,7 @@ class L2MAutoKeyApp:
             self._last_skill_grayed_state = None
             self._last_skill_save_ts = 0
             freeze_start = time.time()
-            FREEZE_TIMEOUT = 15.0  # shortened — if freeze lasts >15s, skill likely lost
+            FREEZE_TIMEOUT = 10.0  # increased from 5s — enemy freeze can last 5-8s in practice
             waiting_logged = False
             skill_cast_done = False
 
@@ -1279,13 +1370,24 @@ class L2MAutoKeyApp:
                 break
 
             if skill_cast_done:
-                # Step 3: Wait 1s (skill active = stun immune)
-                time.sleep(1.0)
-                # Step 4: Cancel 2x + TP BURST — zero gap
+                # Step 3: FILL the 500ms cast-register window with TP spam.
+                # Stun-immunity activates immediately after cast confirm,
+                # so TP attempts during this window can already succeed.
+                # No more dead-time hole between cast and cancel — bot is
+                # ALWAYS spamming TP from the moment cast completes.
                 self._log(f"[CE] Cancel+TP")
-                self.key_sender.send(skill_key)
-                self.key_sender.send(skill_key)
-                for _ in range(10):
+                for _ in range(5):
+                    self.key_sender.send(tp_key)
+                    time.sleep(0.1)  # 5*100ms = 500ms (matches old wait)
+                # Step 4: INTERLEAVED cancel + TP — each cancel attempt is
+                # IMMEDIATELY followed by a TP press.
+                for i in range(4):
+                    self.key_sender.send(skill_key)  # cancel attempt
+                    self.key_sender.send(tp_key)      # TP attempt (right after)
+                    if i < 3:
+                        time.sleep(0.1)
+                # Safety TP burst — extra presses to maximize teleport success
+                for _ in range(6):
                     self.key_sender.send(tp_key)
             else:
                 # Skill never fired (frozen too long) — skip skill, just TP
@@ -1416,6 +1518,96 @@ class L2MAutoKeyApp:
     #  Radar actions
     # ──────────────────────────────────────────────
 
+    def _check_emblem_detection(self, img, now: float):
+        """Proactive emblem detection — fires escape BEFORE radar scan reveals enemy.
+
+        Throttled to 0.5s between checks. Uses EmblemDetector with color
+        pre-filter for performance. Templates: assets/enemy_emblem_*.png
+        managed via Radar tab UI (upload/delete).
+        """
+        settings = self.tab_radar.collect_settings()
+        if not settings.get("emblem_detection_enabled", False):
+            return
+        if not self.key_sender:
+            return
+        if not self.emblem_detector.template_count:
+            return
+
+        # Cooldown 60s after emblem triggered escape
+        if self._emblem_last_trigger_at > 0 and (now - self._emblem_last_trigger_at) < 60:
+            return
+
+        # Throttle to 0.1s between detection attempts (max practical w/ caching)
+        if (now - self._emblem_last_check_at) < 0.1:
+            return
+        self._emblem_last_check_at = now
+
+        try:
+            fname, score = self.emblem_detector.detect(img)
+        except Exception as e:
+            self._log(f"[Emblem] error: {e}")
+            return
+
+        # Log near-misses for diagnostic
+        nm = getattr(self.emblem_detector, 'last_near_miss', None)
+        if nm:
+            nm_fname, nm_tm, nm_ssim, nm_own = nm
+            gap = nm_tm - nm_own
+            self._log(f"[Emblem] near-miss {nm_fname} "
+                      f"(enemy_tm={nm_tm:.3f} ssim={nm_ssim:.3f} own_tm={nm_own:.3f} gap={gap:+.3f}) — skipped")
+
+        if not fname:
+            return
+
+        esc_key = settings.get("emblem_escape_key", "")
+        if not esc_key:
+            self._log(f"[Emblem] Detected {fname} (tm={score:.3f}) — tapi escape key belum di-set!")
+            return
+
+        d_ssim = getattr(self.emblem_detector, 'last_detected_ssim', 0.0)
+        d_own = getattr(self.emblem_detector, 'last_detected_own_tm', 0.0)
+        self._log(f"[Emblem] Detected {fname} (tm={score:.3f} ssim={d_ssim:.3f} own_tm={d_own:.3f}) → Tekan {esc_key}")
+        # Save proof screenshot — base name from template, score, escape key
+        base = os.path.splitext(fname)[0].replace("enemy_emblem_", "")
+        self._save_trigger_screenshot(img, "emblem", f"{base}_tm{score:.2f}_ssim{d_ssim:.2f}_key{esc_key}")
+        self.key_sender.send(esc_key)
+        self._emblem_last_trigger_at = now
+        self._escaped_to_town_at = now
+        self.is_in_town = True
+        self.last_in_town_time = now
+        time.sleep(float(settings.get("emblem_delay", 3.0)))
+
+    def _save_trigger_screenshot(self, img, prefix: str, info: str):
+        """Save screenshot when radar/emblem triggers escape — proof of detection.
+
+        Files saved to lineage2m_autokey/screenshots/<prefix>_<timestamp>_<info>.png
+        Works in both source mode and PyInstaller frozen mode.
+        """
+        try:
+            import sys
+            from datetime import datetime
+            # Determine base directory — always inside lineage2m_autokey/
+            if getattr(sys, 'frozen', False):
+                # PyInstaller --onefile: use exe directory
+                base = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                # Source mode: parent of ui/ → lineage2m_autokey/
+                base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            screenshots_dir = os.path.join(base, "screenshots")
+            os.makedirs(screenshots_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            info_clean = "".join(c if c.isalnum() or c in "_-." else "_" for c in info)[:80]
+            filename = f"{prefix}_{ts}_{info_clean}.png"
+            filepath = os.path.join(screenshots_dir, filename)
+            img.save(filepath, "PNG")
+            # Log full path on first save so user can verify location
+            if not getattr(self, '_screenshot_path_logged', False):
+                self._log(f"[Screenshot] folder: {screenshots_dir}")
+                self._screenshot_path_logged = True
+            self._log(f"[Screenshot] saved: {filename}")
+        except Exception as e:
+            self._log(f"[Screenshot] save error: {e}")
+
     def _check_radar_actions(self, img):
         """Check radar for targets using warning icon template matching."""
         settings = self.tab_radar.collect_settings()
@@ -1452,6 +1644,7 @@ class L2MAutoKeyApp:
                 key = settings.get("radar_condition2_key", "") or settings.get("radar_scan_escape_key", "")
                 if key:
                     self._log(f"Radar: {count} >= {target_count} target! Tekan {key}")
+                    self._save_trigger_screenshot(img, "radar", f"cond2_{count}targets_key{key}")
                     self.key_sender.send(key)
                     self._escaped_to_town_at = time.time()
                     self._radar_last_trigger_at = time.time()
@@ -1467,6 +1660,7 @@ class L2MAutoKeyApp:
                 key = settings.get("radar_condition1_key", "") or settings.get("radar_scan_escape_key", "")
                 if key:
                     self._log(f"Radar: {count} >= {target_count} target! Tekan {key}")
+                    self._save_trigger_screenshot(img, "radar", f"cond1_{count}targets_key{key}")
                     self.key_sender.send(key)
                     self._escaped_to_town_at = time.time()
                     self._radar_last_trigger_at = time.time()
@@ -1475,17 +1669,22 @@ class L2MAutoKeyApp:
                     time.sleep(float(settings.get("radar_condition1_delay", 3.0)))
 
     def _count_radar_targets(self, img) -> int:
-        """Count radar targets using template matching on minimap.
+        """Count radar targets using HYBRID matchTemplate + SSIM verify.
 
         Uses RADAR_TARGET_AREA (full radar number zone) with padding.
-        Searches for radar_1_/radar_3_ number templates AND radar_warn_icon.
-        Both a number AND warning icon must match to confirm enemy presence.
+        Step 1: matchTemplate locates best candidate (fast, ~0.7 threshold).
+        Step 2: SSIM verifies the icon shape at best location (accurate).
+        Both number AND warning icon must pass to confirm enemy presence.
         """
         from core.game_layout import RADAR_TARGET_AREA
+        try:
+            from skimage.metrics import structural_similarity as ssim
+            _SSIM_OK = True
+        except Exception:
+            _SSIM_OK = False
 
         w, h = img.size
 
-        # Use full radar area with extra padding so templates aren't clipped
         ax1, ay1, ax2, ay2 = denormalize(RADAR_TARGET_AREA, w, h)
         pad = 10
         ax1 = max(0, ax1 - pad)
@@ -1495,22 +1694,57 @@ class L2MAutoKeyApp:
 
         cropped = img.crop((ax1, ay1, ax2, ay2))
         crop_bgr = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
+        crop_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Skip radar_1_640 if width > 660 (same as original)
+        # PRE-FILTER: real radar entries have TEAL-GREEN background box (player
+        # list entry). Empty radar ("No scannable targets") has gray/dark area.
+        # Tighter HSV range (specific to radar entry color) + higher ratio
+        # threshold to reject background green (terrain, party UI, etc.)
+        hsv_area = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        # Narrowed HSV: H 60-90 (teal-green), S 100+ (saturated, not gray), V 50-180
+        green_mask = cv2.inRange(hsv_area, np.array([60, 100, 50]), np.array([90, 255, 180]))
+        green_ratio = float(np.sum(green_mask > 0)) / max(green_mask.size, 1)
+        if green_ratio < 0.08:  # require ≥8% teal-green pixels (real entry box)
+            return 0  # no radar entries visible
+
         skip_640 = w > 660
 
-        # Step 1: Check for number templates (radar_1_ or radar_3_)
+        # STRICTER thresholds to eliminate false positives in active gameplay.
+        # Previous fast-path TM=0.82 was bypassing SSIM and allowing FPs.
+        TM_FAST = 0.92   # only very high confidence skips SSIM (was 0.82)
+        TM_NUM = 0.75    # min TM to consider (was 0.72)
+        SSIM_NUM = 0.52  # SSIM verify threshold (was 0.48)
+        TM_NUM_FALLBACK = 0.92
+
+        # Aggregate: require MORE template consensus
+        tm_high_count = 0
+        TM_AGG = 0.82    # was 0.78
+        TM_AGG_MIN_COUNT = 4  # was 3
+
+        # Lazy-cache radar templates on first call (avoid repeated disk I/O)
+        if self._radar_templates_cache is None:
+            cache = []
+            for fname in os.listdir("assets"):
+                if not (fname.startswith("radar_1_") or fname.startswith("radar_3_")):
+                    continue
+                if not fname.endswith(('.png', '.jpg', '.jpeg')):
+                    continue
+                try:
+                    tpl_bgr, tpl_mask = load_image(os.path.join("assets", fname))
+                    tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+                    cache.append((fname, tpl_bgr, tpl_mask, tpl_gray))
+                except Exception:
+                    pass
+            self._radar_templates_cache = cache
+            self._log(f"Radar: cached {len(cache)} number templates")
+
+        # Step 1: Number templates (from cache, no disk I/O per iteration)
         number_found = False
-        for fname in os.listdir("assets"):
-            if not (fname.startswith("radar_1_") or fname.startswith("radar_3_")):
-                continue
+        for fname, template_bgr, mask, tpl_gray in self._radar_templates_cache:
             if skip_640 and "640" in fname:
-                continue
-            if not fname.endswith(('.png', '.jpg', '.jpeg')):
                 continue
 
             try:
-                template_bgr, mask = load_image(os.path.join("assets", fname))
                 th, tw = template_bgr.shape[:2]
                 sh, sw = crop_bgr.shape[:2]
                 if th > sh or tw > sw:
@@ -1519,29 +1753,77 @@ class L2MAutoKeyApp:
                     result = cv2.matchTemplate(crop_bgr, template_bgr, cv2.TM_CCORR_NORMED, mask=mask)
                 else:
                     result = cv2.matchTemplate(crop_bgr, template_bgr, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, _ = cv2.minMaxLoc(result)
-                if max_val >= 0.82:
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                # Fast-path: very high TM → trust immediately (matches old code behavior)
+                if max_val >= TM_FAST:
                     number_found = True
-                    self._log(f"Radar: {fname} matched (score={max_val:.3f})")
+                    self._log(f"Radar: {fname} matched (tm={max_val:.3f}, fast-path)")
                     break
+
+                if not _SSIM_OK:
+                    if max_val >= TM_NUM_FALLBACK:
+                        number_found = True
+                        self._log(f"Radar: {fname} matched (tm={max_val:.3f}, no-ssim)")
+                        break
+                    continue
+
+                if max_val < TM_NUM:
+                    continue
+
+                # Track aggregate signal
+                if max_val >= TM_AGG:
+                    tm_high_count += 1
+
+                # SSIM verify on grayscale crop at best location (tpl_gray from cache)
+                tl_x, tl_y = max_loc
+                actual = crop_gray[tl_y:tl_y + th, tl_x:tl_x + tw]
+                if actual.shape != tpl_gray.shape:
+                    continue
+                try:
+                    ssim_score = float(ssim(actual, tpl_gray, data_range=255))
+                except Exception:
+                    ssim_score = 0.0
+                if ssim_score >= SSIM_NUM:
+                    number_found = True
+                    self._log(f"Radar: {fname} matched (tm={max_val:.3f} ssim={ssim_score:.3f})")
+                    break
+                else:
+                    self._log(f"Radar: {fname} tm-ok but ssim-fail (tm={max_val:.3f} ssim={ssim_score:.3f})")
             except Exception:
                 pass
+
+        # Aggregate fallback: multiple templates with high TM = strong consensus
+        if not number_found and tm_high_count >= TM_AGG_MIN_COUNT:
+            number_found = True
+            self._log(f"Radar: matched via aggregate ({tm_high_count} templates tm≥{TM_AGG})")
 
         if not number_found:
             return 0
 
-        # Step 2: Confirm with warning icon (radar_warn_icon.png)
-        # Enemy radar always shows number + ❗ icon together
-        warn_path = os.path.join("assets", "radar_warn_icon.png")
-        if os.path.exists(warn_path):
+        # Step 2: Confirm with warning icon — TM-only (mask SSIM unreliable for ❗)
+        # TM_CCORR_NORMED + alpha mask is robust enough for the warn icon;
+        # SSIM with mask was rejecting legit matches due to mask-edge artifacts.
+        # Lazy-cache warn_icon template (avoid disk I/O every iteration)
+        if self._radar_warn_template_cache is None:
+            warn_path = os.path.join("assets", "radar_warn_icon.png")
+            if os.path.exists(warn_path):
+                try:
+                    bgr, m = load_image(warn_path)
+                    self._radar_warn_template_cache = (bgr, m)
+                except Exception:
+                    self._radar_warn_template_cache = (None, None)
+            else:
+                self._radar_warn_template_cache = (None, None)
+
+        warn_tmpl, warn_mask = self._radar_warn_template_cache
+        if warn_tmpl is not None:
             try:
-                # Use wider region for warning icon (it appears to the side of numbers)
                 warn_region = img.crop((
                     max(0, ax1 - 40), max(0, ay1 - 20),
                     min(w, ax2 + 40), min(h, ay2 + 20)
                 ))
                 warn_bgr = cv2.cvtColor(np.array(warn_region), cv2.COLOR_RGB2BGR)
-                warn_tmpl, warn_mask = load_image(warn_path)
                 wth, wtw = warn_tmpl.shape[:2]
                 wsh, wsw = warn_bgr.shape[:2]
                 if wth <= wsh and wtw <= wsw:
@@ -1550,16 +1832,18 @@ class L2MAutoKeyApp:
                     else:
                         result = cv2.matchTemplate(warn_bgr, warn_tmpl, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(result)
-                    if max_val >= 0.75:
-                        self._log(f"Radar: warn_icon confirmed (score={max_val:.3f})")
+                    # Threshold 0.82 — slight bump from 0.75. Real ❗ icon
+                    # consistently matches at 0.85+. Primary FP defense is
+                    # the GREEN pre-filter + stricter number TM/SSIM.
+                    if max_val >= 0.82:
+                        self._log(f"Radar: warn_icon confirmed (tm={max_val:.3f})")
                         return 1
-                    else:
-                        self._log(f"Radar: number found but warn_icon low (score={max_val:.3f}), skip")
-                        return 0
+                    self._log(f"Radar: warn_icon tm-low (tm={max_val:.3f}), skip")
+                    return 0
             except Exception:
                 pass
 
-        # If warn icon file missing, fall back to number-only (but high threshold)
+        # If warn icon file missing, fall back to number-only
         return 1
 
     # ──────────────────────────────────────────────
@@ -2024,19 +2308,52 @@ class L2MAutoKeyApp:
         interval = settings.get("radar_scan_interval", 3)
 
         if not scan_key or not self.key_sender:
+            self._log(f"[RadarSpam] STOP — scan_key='{scan_key}' key_sender={bool(self.key_sender)}")
             return
 
+        self._log(f"[RadarSpam] START — key='{scan_key}' interval={interval}s")
+
+        last_pause_reason = None
+        last_pause_log_at = 0.0
+        send_count = 0
+        last_send_log_at = 0.0
         while not self.stop_event.is_set():
             try:
-                if (self.is_in_town or self._escaped_to_town_at > 0
-                        or self.isBlockedByMouseAction
-                        or self._combat_escape_triggered):
+                # Determine pause reason (if any) for diagnostics
+                pause_reason = None
+                if self.is_in_town:
+                    pause_reason = "is_in_town"
+                elif self._escaped_to_town_at > 0:
+                    pause_reason = f"escaped_to_town ({time.time() - self._escaped_to_town_at:.0f}s)"
+                elif self.isBlockedByMouseAction:
+                    pause_reason = "mouse_action"
+                elif self._combat_escape_triggered:
+                    pause_reason = "combat_escape"
+
+                if pause_reason:
+                    # Log only on transition or every 10s, to avoid spam
+                    now = time.time()
+                    if pause_reason != last_pause_reason or (now - last_pause_log_at) > 10:
+                        self._log(f"[RadarSpam] PAUSE — {pause_reason}")
+                        last_pause_reason = pause_reason
+                        last_pause_log_at = now
                     self.stop_event.wait(1)
                     continue
 
+                # Log resume
+                if last_pause_reason is not None:
+                    self._log(f"[RadarSpam] RESUME — was paused by {last_pause_reason}")
+                    last_pause_reason = None
+
                 self.key_sender.send(scan_key)
+                send_count += 1
+                now = time.time()
+                if (now - last_send_log_at) > 30:
+                    self._log(f"[RadarSpam] sent {send_count}x (key={scan_key})")
+                    last_send_log_at = now
                 self.stop_event.wait(interval)
-            except Exception:
+            except Exception as e:
+                self._log(f"[RadarSpam] error: {e}")
                 self.stop_event.wait(1)
 
     def _radar_scan_loop(self):
@@ -2223,6 +2540,15 @@ class L2MAutoKeyApp:
                 self.last_auto_tp_at = now
                 self._escaped_to_town_at = 0
                 self._radar_last_trigger_at = 0  # Reset radar cooldown
+                # Force-reset ALL state so radar/CE spam resumes immediately.
+                # Setting _prev_in_town=False bypasses the screen loop transition
+                # check, so we MUST reset combat_escape flags here too — otherwise
+                # _combat_escape_triggered stays True and radar key spam stays paused.
+                self.is_in_town = False
+                self._prev_in_town = False
+                self.last_in_town_time = 0
+                self._combat_escape_triggered = False
+                self._combat_escape_last_at = 0
                 self.do_auto_hunt = True
                 return
 
