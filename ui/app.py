@@ -1074,31 +1074,40 @@ class L2MAutoKeyApp:
         if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 1:
             return
 
-        # Lazy-cache combat icon template at all scales (eliminates per-call disk I/O
-        # and resize — was ~30-50ms overhead per main loop iteration).
+        # Lazy-cache combat icon templates at all scales (eliminates per-call I/O).
+        # MULTI-TEMPLATE: loads all assets/combat_icon*.png variants — covers
+        # different visual states (dim fade-in, normal, bright glow). More
+        # templates = more chances to match in any phase of the icon animation.
         if not getattr(self, '_combat_icon_cache_loaded', False):
             self._combat_icon_cache_loaded = True
-            self._combat_icon_cache = []  # list of (nh, nw, gray)
-            combat_icon_path = os.path.join("assets", "combat_icon.png")
-            if not os.path.exists(combat_icon_path):
-                self._log("[CE] combat_icon.png not found, detection disabled")
-                return
+            self._combat_icon_cache = []  # list of (fname, nh, nw, gray)
+            assets_dir = "assets"
             try:
-                tpl_bgr, _ = load_image(combat_icon_path)
-                tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
-                # Reduced scale set — common ones only (was 9 scales, now 5)
-                for scale in (0.625, 0.8, 1.0, 1.25, 1.5):
-                    th, tw = tpl_gray.shape[:2]
-                    nw = max(10, int(tw * scale))
-                    nh = max(10, int(th * scale))
-                    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-                    self._combat_icon_cache.append(
-                        (nh, nw, cv2.resize(tpl_gray, (nw, nh), interpolation=interp))
-                    )
-                self._log(f"[CE] cached {len(self._combat_icon_cache)} combat icon scales")
-            except Exception as e:
-                self._log(f"[CE] template cache error: {e}")
+                template_files = sorted(
+                    f for f in os.listdir(assets_dir)
+                    if f.startswith("combat_icon") and f.lower().endswith((".png", ".jpg", ".jpeg"))
+                )
+            except Exception:
+                template_files = ["combat_icon.png"]
+            if not template_files:
+                self._log("[CE] no combat_icon*.png templates found, detection disabled")
                 return
+            for fname in template_files:
+                path = os.path.join(assets_dir, fname)
+                try:
+                    tpl_bgr, _ = load_image(path)
+                    tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+                    for scale in (0.625, 0.8, 1.0, 1.25, 1.5):
+                        th, tw = tpl_gray.shape[:2]
+                        nw = max(10, int(tw * scale))
+                        nh = max(10, int(th * scale))
+                        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+                        self._combat_icon_cache.append(
+                            (fname, nh, nw, cv2.resize(tpl_gray, (nw, nh), interpolation=interp))
+                        )
+                except Exception as e:
+                    self._log(f"[CE] template '{fname}' cache error: {e}")
+            self._log(f"[CE] cached {len(self._combat_icon_cache)} entries from {len(template_files)} templates")
 
         if not self._combat_icon_cache:
             return
@@ -1114,23 +1123,27 @@ class L2MAutoKeyApp:
         crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
         sh, sw = crop_gray.shape[:2]
 
-        # Fast path: try scales until one matches; break early
+        # Fast path: try all templates × scales; break early on very high score
         best_val = 0
+        best_template = None
         try:
-            for nh, nw, tpl_gray in self._combat_icon_cache:
+            for fname, nh, nw, tpl_gray in self._combat_icon_cache:
                 if nh > sh or nw > sw:
                     continue
                 result = cv2.matchTemplate(crop_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
                 _, max_val_s, _, _ = cv2.minMaxLoc(result)
                 if max_val_s > best_val:
                     best_val = max_val_s
+                    best_template = fname
                     if best_val >= 0.92:
-                        break  # very high confidence, skip remaining scales
+                        break  # very high confidence, skip rest
 
-            if best_val < 0.85:
+            # Threshold lowered 0.85 → 0.82 — multi-template covers fade-in phase,
+            # icon can be detected earlier with slightly lower individual score.
+            if best_val < 0.82:
                 return
 
-            self._log(f"[CE] Combat icon detected! (score={best_val:.3f})")
+            self._log(f"[CE] Combat icon detected! ({best_template} score={best_val:.3f})")
         except Exception:
             return
 
@@ -1364,31 +1377,22 @@ class L2MAutoKeyApp:
                 else:
                     self._log(f"[CE] Skill 2x")
                 self.key_sender.send(skill_key)
-                time.sleep(0.05)
+                time.sleep(0.07)  # 70ms inter-press — sweet spot for cast activation
                 self.key_sender.send(skill_key)
                 skill_cast_done = True
                 break
 
             if skill_cast_done:
-                # Step 3: FILL the 500ms cast-register window with TP spam.
-                # Stun-immunity activates immediately after cast confirm,
-                # so TP attempts during this window can already succeed.
-                # No more dead-time hole between cast and cancel — bot is
-                # ALWAYS spamming TP from the moment cast completes.
+                # Step 3: WAIT for cast register server-side
+                time.sleep(0.5)
+                # Step 4: Cancel 2x BURST + TP BURST — ZERO GAP (v1.5 pattern)
+                # Cancel selesai → langsung TP spam, tidak ada hole untuk enemy
+                # melakukan stun antara cancel dan teleport.
                 self._log(f"[CE] Cancel+TP")
-                for _ in range(5):
-                    self.key_sender.send(tp_key)
-                    time.sleep(0.1)  # 5*100ms = 500ms (matches old wait)
-                # Step 4: INTERLEAVED cancel + TP — each cancel attempt is
-                # IMMEDIATELY followed by a TP press.
-                for i in range(4):
-                    self.key_sender.send(skill_key)  # cancel attempt
-                    self.key_sender.send(tp_key)      # TP attempt (right after)
-                    if i < 3:
-                        time.sleep(0.1)
-                # Safety TP burst — extra presses to maximize teleport success
-                for _ in range(6):
-                    self.key_sender.send(tp_key)
+                self.key_sender.send(skill_key)  # cancel 1
+                self.key_sender.send(skill_key)  # cancel 2 (no gap)
+                for _ in range(10):
+                    self.key_sender.send(tp_key)  # TP × 10 (rapid burst)
             else:
                 # Skill never fired (frozen too long) — skip skill, just TP
                 self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill, TP only")
