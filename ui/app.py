@@ -223,6 +223,11 @@ class L2MAutoKeyApp:
                                    command=self.stop_all, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=5)
 
+        # Manual update check button (bypasses 24h throttle)
+        self.btn_update = ttk.Button(btn_frame, text="Cek Update",
+                                     command=self._check_update_now)
+        self.btn_update.pack(side=tk.LEFT, padx=5)
+
         # === Notebook (tabs) ===
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -485,6 +490,15 @@ class L2MAutoKeyApp:
             )
         except Exception:
             pass
+
+    def _check_update_now(self):
+        """Manual update check — bypass 24h throttle, force check GitHub immediately."""
+        try:
+            from updater import check_for_updates
+            self._log(f"[Updater] Manual check requested (current=v{__version__})")
+            check_for_updates(self.root, force=True)
+        except Exception as e:
+            self._log(f"[Updater] Manual check error: {e}")
 
     def stop_all(self):
         self.stop_event.set()
