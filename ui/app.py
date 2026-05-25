@@ -1932,17 +1932,17 @@ class L2MAutoKeyApp:
     def _key_loop(self, key: str, interval: float, condition: str):
         """Key press loop - matches original send_key_loop logic.
         Conditions: anytime, when_attacked (same as original 5 conditions)."""
-        TICK = 0.3  # Check every 0.3s like original
         anytime = self.lang.get("anytime", "Kapan saja")
         last_press = 0.0
 
         while not self.stop_event.is_set():
             try:
                 now = time.monotonic()
+                elapsed = now - last_press
 
                 # Skip during mouse actions (like original)
                 if self.isBlockedByMouseAction:
-                    self.stop_event.wait(TICK)
+                    self.stop_event.wait(0.1)
                     continue
 
                 # Check condition
@@ -1950,15 +1950,16 @@ class L2MAutoKeyApp:
                 if condition == anytime:
                     should_send = True
                 else:
-                    # "Saat diserang" condition
                     should_send = self.is_attacked
 
                 # Check interval and send
-                if should_send and (now - last_press) >= interval:
+                if should_send and elapsed >= interval:
                     self._send_key_safe(key)
                     last_press = time.monotonic()
-
-                self.stop_event.wait(TICK)
+                    self.stop_event.wait(min(interval, 0.5))
+                else:
+                    remaining = max(0.05, interval - elapsed)
+                    self.stop_event.wait(min(remaining, 0.1))
 
             except Exception as e:
                 print(f"[KeyLoop] {key} error: {e}")

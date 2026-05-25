@@ -48,12 +48,48 @@ def run_as_admin():
 
 
 def get_hwid() -> str:
-    """Generate hardware ID from machine-specific identifiers.
-    Combines: machine UUID + MAC address → SHA256 → 16 char hex.
+    """Generate stable hardware ID.
+
+    Primary: Windows MachineGuid (registry) — stable across restarts.
+    Fallback: BIOS UUID via wmic.
+    Does NOT use MAC address — uuid.getnode() returns random values
+    when virtual adapters change between restarts (VPN, Hyper-V, Wi-Fi).
     """
+    import winreg
+
+    # Primary: MachineGuid — generated at OS install, never changes between restarts
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SOFTWARE\Microsoft\Cryptography")
+        machine_guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+        winreg.CloseKey(key)
+        if machine_guid and len(machine_guid) > 8:
+            return hashlib.sha256(machine_guid.encode()).hexdigest()[:16].upper()
+    except Exception:
+        pass
+
+    # Fallback: BIOS UUID (stable, but wmic deprecated on Win11)
     try:
         import subprocess
-        # Get machine UUID from BIOS (unique per motherboard)
+        r = subprocess.run(
+            ['wmic', 'csproduct', 'get', 'UUID'],
+            capture_output=True, text=True, timeout=5
+        )
+        bios_uuid = r.stdout.strip().split('\n')[-1].strip()
+        if bios_uuid and bios_uuid != "UUID" and len(bios_uuid) > 8:
+            return hashlib.sha256(bios_uuid.encode()).hexdigest()[:16].upper()
+    except Exception:
+        pass
+
+    # Last resort: MAC (less stable but better than nothing)
+    mac = hex(uuid.getnode())
+    return hashlib.sha256(mac.encode()).hexdigest()[:16].upper()
+
+
+def _get_legacy_hwid() -> str:
+    """Old HWID algorithm (BIOS UUID + MAC) — for migration only."""
+    try:
+        import subprocess
         r = subprocess.run(
             ['wmic', 'csproduct', 'get', 'UUID'],
             capture_output=True, text=True, timeout=5
@@ -61,16 +97,25 @@ def get_hwid() -> str:
         machine_uuid = r.stdout.strip().split('\n')[-1].strip()
     except Exception:
         machine_uuid = "unknown"
-
-    # MAC address
     mac = hex(uuid.getnode())
-
     raw = f"{machine_uuid}:{mac}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
 
 
 def _get_license_cache_path() -> str:
-    """Path to cached license code (next to exe or in project root)."""
+    """Path to cached license code in %LOCALAPPDATA% (stable across restarts).
+
+    Using LOCALAPPDATA instead of next-to-exe because:
+    - Survives exe updates/re-downloads
+    - Not affected by OneDrive sync
+    - Always writable without admin
+    """
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        cache_dir = os.path.join(local_app, "L2M_AutoKey")
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, ".license")
+    # Fallback: next to exe
     if hasattr(sys, '_MEIPASS'):
         base = os.path.dirname(sys.executable)
     else:
@@ -102,7 +147,11 @@ def _save_cached_code(code: str):
 
 
 def _check_license_silent(code: str, hwid: str) -> tuple[bool, str]:
-    """Check license against Supabase without UI. Returns (valid, message)."""
+    """Check license against Supabase without UI. Returns (valid, message).
+
+    Handles HWID migration: if stored HWID matches old algorithm (UUID+MAC),
+    auto-updates to new stable HWID (MachineGuid).
+    """
     from datetime import datetime, timezone
     if not code:
         return False, "No code"
@@ -125,7 +174,16 @@ def _check_license_silent(code: str, hwid: str) -> tuple[bool, str]:
                 pass
         stored_hwid = lic.get("hwid", "")
         if stored_hwid and stored_hwid != hwid:
-            return False, "Code sudah dipakai di PC lain"
+            # Migration: check if stored HWID matches old algorithm
+            legacy = _get_legacy_hwid()
+            if stored_hwid == legacy:
+                # Same PC, old algorithm — migrate to new stable HWID
+                print(f"[License] Migrating HWID: {stored_hwid} → {hwid}")
+                client.table("licenses").update({
+                    "hwid": hwid,
+                }).eq("code", code).execute()
+            else:
+                return False, "Code sudah dipakai di PC lain"
         if not stored_hwid:
             client.table("licenses").update({
                 "hwid": hwid,
@@ -207,9 +265,20 @@ def validate_license() -> bool:
                     status_label.config(text=f"Gagal aktivasi: {e}", foreground="red")
                     return False
             elif stored_hwid != hwid:
-                # Different PC
-                status_label.config(text="Code sudah dipakai di PC lain!", foreground="red")
-                return False
+                # Migration: check if stored HWID matches old algorithm
+                legacy = _get_legacy_hwid()
+                if stored_hwid == legacy:
+                    try:
+                        client.table("licenses").update({
+                            "hwid": hwid,
+                        }).eq("code", code).execute()
+                        status_label.config(text="HWID diperbarui!", foreground="green")
+                    except Exception as e:
+                        status_label.config(text=f"Gagal update HWID: {e}", foreground="red")
+                        return False
+                else:
+                    status_label.config(text="Code sudah dipakai di PC lain!", foreground="red")
+                    return False
 
             # Valid!
             _save_cached_code(code)
