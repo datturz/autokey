@@ -1506,8 +1506,8 @@ class L2MAutoKeyApp:
             else:
                 self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill")
 
-        # Step 5: Spam TP until town detected (NPC list / shop icon muncul)
-        self._log(f"[CE] Spam TP '{tp_key}' sampai di kota...")
+        # Step 5: Burst TP until town detected (NPC list / shop icon muncul)
+        self._log(f"[CE] Burst TP '{tp_key}' sampai di kota...")
         self._escaped_to_town_at = time.time()
         self.is_in_town = True
         self.last_in_town_time = time.time()
@@ -1516,25 +1516,26 @@ class L2MAutoKeyApp:
         arrived = False
         tp_start = time.time()
         TP_TIMEOUT = 60.0
-        tp_count = 0
+        BURST_SIZE = 10
+        burst_round = 0
         while (time.time() - tp_start) < TP_TIMEOUT:
             if self.stop_event.is_set():
                 return
-            # Spam TP key
-            self.key_sender.send(tp_key)
-            tp_count += 1
-            # Check town every 0.3s (don't check every send — too expensive)
-            if tp_count % 3 == 0:
-                try:
-                    img = self.capturer.capture() if self.capturer else None
-                    if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
-                        arrived = True
-                        elapsed = time.time() - tp_start
-                        self._log(f"[CE] Town detected! ({elapsed:.1f}s, {tp_count} TP sent)")
-                        break
-                except Exception:
-                    pass
-            time.sleep(0.1)
+            # Burst: rapid fire TP (no delay between sends)
+            for _ in range(BURST_SIZE):
+                self.key_sender.send(tp_key)
+            burst_round += 1
+            # Check town after each burst
+            time.sleep(0.3)
+            try:
+                img = self.capturer.capture() if self.capturer else None
+                if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
+                    arrived = True
+                    elapsed = time.time() - tp_start
+                    self._log(f"[CE] Town detected! ({elapsed:.1f}s, {burst_round * BURST_SIZE} TP sent)")
+                    break
+            except Exception:
+                pass
 
         if not arrived:
             self._log(f"[CE] TP timeout {TP_TIMEOUT:.0f}s — town not detected, lanjut...")
