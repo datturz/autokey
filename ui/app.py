@@ -653,19 +653,21 @@ class L2MAutoKeyApp:
         """Check if inventory or skill window is open (blocks key sending).
 
         Original: ignorePressingKey checks IGNORE_KEY_INVENTORY and IGNORE_KEY_SKILL regions.
+        Uses dark pixel ratio but requires VERY dark (< 30) and high ratio (> 0.70)
+        to avoid false positives in dark game scenes (nighttime, dungeons).
+        Also requires at least 2 of 3 regions to be dark (consensus).
         """
         w, h = img.size
-        # Check inventory region — dark panel with specific patterns
+        dark_count = 0
         for region in [IGNORE_KEY_INVENTORY, IGNORE_KEY_SKILL, IGNORE_KEY_DIALOG]:
             rx1, ry1, rx2, ry2 = denormalize(region, w, h)
             crop = img.crop((rx1, ry1, rx2, ry2))
             arr = np.array(crop)
             gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-            # These UI panels have dark backgrounds
-            dark_ratio = np.sum(gray < 60) / gray.size
-            if dark_ratio > 0.50:
-                return True
-        return False
+            dark_ratio = np.sum(gray < 30) / gray.size
+            if dark_ratio > 0.70:
+                dark_count += 1
+        return dark_count >= 2
 
     def _load_skill_templates(self):
         """Load skill state templates from assets (once)."""
@@ -1936,8 +1938,9 @@ class L2MAutoKeyApp:
     #  Key sending with safety checks
     # ──────────────────────────────────────────────
 
-    def _send_key_safe(self, key: str):
+    def _send_key_safe(self, key: str) -> bool:
         """Send key with safety checks matching original sendKey().
+        Returns True if key was sent, False if blocked.
 
         Original differences:
         - Block when in town for > 3 seconds (not just any is_in_town)
@@ -1946,27 +1949,28 @@ class L2MAutoKeyApp:
         - PS key: capture screenshot and save to file
         """
         if not self.key_sender or not key:
-            return
+            return False
 
         # Block ALL keys when escaped to town via radar (waiting for TP back)
         if self._escaped_to_town_at > 0:
-            return
+            return False
 
         settings = self.tab_main.collect_settings()
 
         # Block when in town for > 3 seconds (original: last_time_in_town > 3s)
         if settings.get("no_press_in_safe_area") and self.is_in_town:
             if self.last_in_town_time > 0 and (time.time() - self.last_in_town_time) > 3:
-                return
+                return False
 
-        # Block when inventory/skill window is open
-        img = self._last_img_for_checks
-        if img is not None:
-            try:
-                if self._is_inventory_or_skill_open(img):
-                    return
-            except Exception:
-                pass
+        # Block when inventory/skill window is open (only if option enabled)
+        if settings.get("no_press_when_inventory_open", True):
+            img = self._last_img_for_checks
+            if img is not None:
+                try:
+                    if self._is_inventory_or_skill_open(img):
+                        return False
+                except Exception:
+                    pass
 
         # PS key: capture screenshot and save to file
         if key.upper() in ("PS", "PRTSC"):
@@ -1978,7 +1982,7 @@ class L2MAutoKeyApp:
                     self._log(f"Screenshot: {save_path}")
             except Exception as e:
                 print(f"[SendKey] PS screenshot error: {e}")
-            return
+            return True
 
         # F5/F6/F10: double-press with 0.3s gap (original behavior)
         if key in ("F5", "F6", "F10"):
@@ -1987,6 +1991,7 @@ class L2MAutoKeyApp:
             self.key_sender.send(key)
         else:
             self.key_sender.send(key)
+        return True
 
     def _send_key_force(self, key: str):
         """Send key without any checks."""
@@ -1998,36 +2003,48 @@ class L2MAutoKeyApp:
     # ──────────────────────────────────────────────
 
     def _key_loop(self, key: str, interval: float, condition: str):
-        """Key press loop - matches original send_key_loop logic.
-        Conditions: anytime, when_attacked (same as original 5 conditions)."""
+        """Key press loop - sends key exactly every `interval` seconds.
+
+        Timing: uses monotonic clock, only advances last_press when key
+        actually sent (not when blocked). If blocked by safety checks,
+        retries on next tick instead of skipping the interval.
+        """
         anytime = self.lang.get("anytime", "Kapan saja")
-        last_press = 0.0
+        last_press = time.monotonic() - interval  # fire immediately on start
 
         while not self.stop_event.is_set():
             try:
                 now = time.monotonic()
                 elapsed = now - last_press
 
-                # Skip during mouse actions (like original)
+                if elapsed < interval:
+                    # Not yet time — sleep precisely until next fire
+                    remaining = interval - elapsed
+                    self.stop_event.wait(min(remaining, 0.1))
+                    continue
+
+                # Time to fire — check conditions
                 if self.isBlockedByMouseAction:
                     self.stop_event.wait(0.1)
                     continue
 
-                # Check condition
                 should_send = False
                 if condition == anytime:
                     should_send = True
                 else:
                     should_send = self.is_attacked
 
-                # Check interval and send
-                if should_send and elapsed >= interval:
-                    self._send_key_safe(key)
+                if not should_send:
+                    self.stop_event.wait(0.1)
+                    continue
+
+                # Send key — only advance timer if actually sent
+                sent = self._send_key_safe(key)
+                if sent:
                     last_press = time.monotonic()
-                    self.stop_event.wait(min(interval, 0.5))
-                else:
-                    remaining = max(0.05, interval - elapsed)
-                    self.stop_event.wait(min(remaining, 0.1))
+
+                # Small pause after attempt to prevent tight loop
+                self.stop_event.wait(0.05)
 
             except Exception as e:
                 print(f"[KeyLoop] {key} error: {e}")
