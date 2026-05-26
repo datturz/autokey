@@ -1499,48 +1499,45 @@ class L2MAutoKeyApp:
             if skill_cast_done:
                 # Step 3: WAIT for cast register server-side
                 time.sleep(0.5)
-                # Step 4: Cancel 2x BURST + TP BURST — ZERO GAP (v1.5 pattern)
-                # Cancel selesai → langsung TP spam, tidak ada hole untuk enemy
-                # melakukan stun antara cancel dan teleport.
-                self._log(f"[CE] Cancel+TP")
+                # Step 4: Cancel 2x BURST — ZERO GAP (v1.5 pattern)
+                self._log(f"[CE] Cancel skill")
                 self.key_sender.send(skill_key)  # cancel 1
                 self.key_sender.send(skill_key)  # cancel 2 (no gap)
-                for _ in range(10):
-                    self.key_sender.send(tp_key)  # TP × 10 (rapid burst)
             else:
-                # Skill never fired (frozen too long) — skip skill, just TP
-                self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill, TP only")
-                for _ in range(10):
-                    self.key_sender.send(tp_key)
-        else:
-            for _ in range(10):
-                self.key_sender.send(tp_key)
+                self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill")
 
-        # Set town state
+        # Step 5: Spam TP until town detected (NPC list / shop icon muncul)
+        self._log(f"[CE] Spam TP '{tp_key}' sampai di kota...")
         self._escaped_to_town_at = time.time()
         self.is_in_town = True
         self.last_in_town_time = time.time()
         self.do_auto_hunt = True
 
-        # === Wait for town arrival ===
-        self._log("[CE] Waiting for town...")
         arrived = False
-        for wait_try in range(10):
-            time.sleep(1.0)
+        tp_start = time.time()
+        TP_TIMEOUT = 60.0
+        tp_count = 0
+        while (time.time() - tp_start) < TP_TIMEOUT:
             if self.stop_event.is_set():
                 return
-            try:
-                img = self.capturer.capture() if self.capturer else None
-                if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
-                    arrived = True
-                    self._log(f"[CE] Town OK! ({wait_try+1}s)")
-                    break
-            except Exception:
-                pass
+            # Spam TP key
+            self.key_sender.send(tp_key)
+            tp_count += 1
+            # Check town every 0.3s (don't check every send — too expensive)
+            if tp_count % 3 == 0:
+                try:
+                    img = self.capturer.capture() if self.capturer else None
+                    if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
+                        arrived = True
+                        elapsed = time.time() - tp_start
+                        self._log(f"[CE] Town detected! ({elapsed:.1f}s, {tp_count} TP sent)")
+                        break
+                except Exception:
+                    pass
+            time.sleep(0.1)
 
         if not arrived:
-            self._log("[CE] Town not confirmed, wait 3s")
-            time.sleep(3)
+            self._log(f"[CE] TP timeout {TP_TIMEOUT:.0f}s — town not detected, lanjut...")
 
         # === Wait screen loaded, then weapon back ===
         if weapon_back_key:
