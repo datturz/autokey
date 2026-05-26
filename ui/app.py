@@ -4666,8 +4666,29 @@ class L2MAutoKeyApp:
         self._pressing_key_after_teleporting(cancel_key, autohunt_key)
 
     def _pressing_key_after_teleporting(self, cancel_key: str = "", autohunt_key: str = ""):
-        """Setelah teleport selesai: cancel attack lalu start auto hunt."""
+        """Setelah teleport selesai: reset semua state, cancel attack, start auto hunt.
+
+        This is the SINGLE exit point after every successful teleport.
+        ALL feature states must be reset here so combat escape, radar, etc.
+        work immediately at the new farming spot.
+        """
         time.sleep(5.0)  # tunggu loading map selesai
+
+        # Full reset ALL feature states — clean slate for hunting
+        self.is_in_town = False
+        self._prev_in_town = False
+        self.last_in_hunting_time = time.time()
+        self.last_in_town_time = 0
+        self._escaped_to_town_at = 0
+        self._radar_last_trigger_at = 0
+        self._combat_escape_triggered = False
+        self._combat_escape_last_at = 0
+        self._combat_icon_escape_last_at = 0
+        self._emblem_last_trigger_at = 0
+        self.do_auto_hunt = False
+        self._potion_low_count = 0
+        self._potion_buy_active = False
+        self._log("[TP] Teleport selesai — semua feature direset")
 
         if not self.key_sender:
             return
