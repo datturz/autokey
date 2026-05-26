@@ -2003,31 +2003,41 @@ class L2MAutoKeyApp:
     # ──────────────────────────────────────────────
 
     def _key_loop(self, key: str, interval: float, condition: str):
-        """Key press loop - sends key exactly every `interval` seconds.
+        """Key press loop - LOW PRIORITY. Yields to all high-priority features.
 
-        Timing: uses monotonic clock, only advances last_press when key
-        actually sent (not when blocked). If blocked by safety checks,
-        retries on next tick instead of skipping the interval.
+        Pauses when any feature is active (combat escape, weapon switch,
+        radar escape, boss hunt, teleport). Resumes after feature completes.
+        Timer does NOT advance while paused — no missed presses.
         """
         anytime = self.lang.get("anytime", "Kapan saja")
         last_press = time.monotonic() - interval  # fire immediately on start
 
         while not self.stop_event.is_set():
             try:
+                # LOW PRIORITY: yield to any active feature
+                if self._feature_active:
+                    self.stop_event.wait(0.2)
+                    continue
+
+                # Yield during combat escape sequence (even after feature lock released)
+                if self._combat_escape_triggered or self._escaped_to_town_at > 0:
+                    self.stop_event.wait(0.2)
+                    continue
+
+                # Yield during mouse actions (teleport dialog, map open)
+                if self.isBlockedByMouseAction:
+                    self.stop_event.wait(0.1)
+                    continue
+
                 now = time.monotonic()
                 elapsed = now - last_press
 
                 if elapsed < interval:
-                    # Not yet time — sleep precisely until next fire
                     remaining = interval - elapsed
                     self.stop_event.wait(min(remaining, 0.1))
                     continue
 
                 # Time to fire — check conditions
-                if self.isBlockedByMouseAction:
-                    self.stop_event.wait(0.1)
-                    continue
-
                 should_send = False
                 if condition == anytime:
                     should_send = True
@@ -2043,7 +2053,6 @@ class L2MAutoKeyApp:
                 if sent:
                     last_press = time.monotonic()
 
-                # Small pause after attempt to prevent tight loop
                 self.stop_event.wait(0.05)
 
             except Exception as e:
