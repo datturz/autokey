@@ -491,6 +491,70 @@ class L2MAutoKeyApp:
         except Exception:
             pass
 
+    def _death_limit_dungeon_escape(self):
+        """After max deaths: resurrect already clicked → wait for town → teleport to saved spot.
+
+        Flow:
+        1. Wait for screen to stabilize (town loaded after resurrect)
+        2. Teleport to saved farming spot (user can set this to a dungeon spot)
+        3. Reset death counter
+        4. Continue running — bot NOT stopped
+        """
+        if not self.capturer or not self.key_sender or not self.clicker:
+            return
+
+        self._log("[DEATH→DUNGEON] Menunggu town load setelah resurrect...")
+
+        # Step 1: Wait for town to load (screen stability)
+        arrived = False
+        for wait in range(15):
+            if self.stop_event.is_set():
+                return
+            time.sleep(1.0)
+            try:
+                img = self.capturer.capture()
+                if img is None:
+                    continue
+                stable = self.capturer.is_stable_an_hue_icon(img)
+                in_town = self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)
+                if stable and in_town:
+                    arrived = True
+                    self._log(f"[DEATH→DUNGEON] Town detected ({wait+1}s)")
+                    break
+            except Exception:
+                pass
+
+        if not arrived:
+            self._log("[DEATH→DUNGEON] Town tidak terdeteksi, tunggu 5s lalu coba teleport...")
+            time.sleep(5.0)
+
+        # Set town state
+        self.is_in_town = True
+        self.last_in_town_time = time.time()
+        self._prev_in_town = True
+
+        # Step 2: Teleport to saved spot (user configures this to dungeon spot)
+        settings = self._collect_all_settings()
+        tp_enabled = settings.get("auto_teleport_enabled", False)
+        spots = settings.get("teleport_spots", [False] * 5)
+        has_spots = any(spots)
+
+        if tp_enabled and has_spots:
+            self._log("[DEATH→DUNGEON] Teleport ke saved spot...")
+            time.sleep(2.0)
+            self._teleport_to_spot(settings)
+        else:
+            self._log("[DEATH→DUNGEON] Teleport tidak aktif / spot tidak dipilih — bot tetap jalan di town")
+
+        # Step 3: Reset death counter — fresh start
+        self._death_count = 0
+        self._last_death_at = 0
+        self._escaped_to_town_at = 0
+        self._combat_escape_triggered = False
+        self._combat_escape_last_at = 0
+
+        self._log(f"[DEATH→DUNGEON] Death counter reset, bot lanjut farming")
+
     def _check_update_now(self):
         """Manual update check — bypass 24h throttle, force check GitHub immediately."""
         try:
@@ -818,27 +882,31 @@ class L2MAutoKeyApp:
                 # 3. Check screen stability every frame
                 self._is_stable = self.capturer.is_stable_an_hue_icon(img)
 
-                # 7. Death detection → count + click resurrection + check limit
+                # 7. Death detection → ALWAYS resurrect first, then check limit
                 try:
                     if self.hunting_checker.is_dead(img):
                         now_d = time.time()
-                        # Cooldown 60s — death dialog persists for several frames,
-                        # don't count the same event multiple times
-                        if (now_d - self._last_death_at) > 60:
+                        # Cooldown 60s — death dialog persists for several frames
+                        is_new_death = (now_d - self._last_death_at) > 60
+                        if is_new_death:
                             self._death_count += 1
                             self._last_death_at = now_d
-                            ce_settings = self.tab_farming.collect_settings()
-                            limit_enabled = ce_settings.get("death_limit_enabled", True)
-                            limit_count = ce_settings.get("death_limit_count", 2)
-                            self._log(f"[DEATH] Mati ke-{self._death_count} (limit={limit_count}, enabled={limit_enabled})")
-                            if limit_enabled and self._death_count >= limit_count:
-                                self._log(f"[DEATH] Mencapai limit {limit_count}x — STOP BOT")
-                                self.root.after(0, self._on_death_limit_reached, self._death_count)
-                                return  # Exit screen loop immediately
+                            self._log(f"[DEATH] Mati ke-{self._death_count}")
+
+                        # ALWAYS click Resurrect first — never stay stuck on death screen
                         self._log("Dead! Klik Resurrect at Village (640,525)...")
                         if self.clicker:
                             self.clicker.click_scaled(640, 525)
                             time.sleep(2.0)
+
+                        # Check limit AFTER resurrect
+                        if is_new_death:
+                            ce_settings = self.tab_farming.collect_settings()
+                            limit_enabled = ce_settings.get("death_limit_enabled", True)
+                            limit_count = ce_settings.get("death_limit_count", 2)
+                            if limit_enabled and self._death_count >= limit_count:
+                                self._log(f"[DEATH] Limit {limit_count}x tercapai → pindah ke dungeon")
+                                self._start_thread(self._death_limit_dungeon_escape, "death_dungeon")
                 except Exception:
                     pass
 
