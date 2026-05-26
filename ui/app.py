@@ -228,6 +228,28 @@ class L2MAutoKeyApp:
                                      command=self._check_update_now)
         self.btn_update.pack(side=tk.LEFT, padx=5)
 
+        # Global hotkey selectors
+        HOTKEY_CHOICES = ["", "F7", "F8", "F9", "F11", "F12",
+                          "Home", "End", "Insert", "Delete",
+                          "Pause", "ScrollLock"]
+        ttk.Label(btn_frame, text="  Hotkey:").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(btn_frame, text="Start").pack(side=tk.LEFT, padx=(5, 0))
+        self.hotkey_start_combo = ttk.Combobox(btn_frame, values=HOTKEY_CHOICES,
+                                               width=8, state="readonly")
+        self.hotkey_start_combo.pack(side=tk.LEFT, padx=2)
+        self.hotkey_start_combo.set("F9")
+        self.hotkey_start_combo.bind("<<ComboboxSelected>>", self._on_hotkey_changed)
+
+        ttk.Label(btn_frame, text="Stop").pack(side=tk.LEFT, padx=(5, 0))
+        self.hotkey_stop_combo = ttk.Combobox(btn_frame, values=HOTKEY_CHOICES,
+                                              width=8, state="readonly")
+        self.hotkey_stop_combo.pack(side=tk.LEFT, padx=2)
+        self.hotkey_stop_combo.set("F10")
+        self.hotkey_stop_combo.bind("<<ComboboxSelected>>", self._on_hotkey_changed)
+
+        self._hotkey_ids = []
+        self._setup_hotkeys()
+
         # === Notebook (tabs) ===
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -316,6 +338,12 @@ class L2MAutoKeyApp:
         self.tab_daily.apply_settings(settings)
         if self.tab_dungeon:
             self.tab_dungeon.apply_settings(settings)
+        # Hotkeys
+        if settings.get("hotkey_start"):
+            self.hotkey_start_combo.set(settings["hotkey_start"])
+        if settings.get("hotkey_stop"):
+            self.hotkey_stop_combo.set(settings["hotkey_stop"])
+        self._setup_hotkeys()
 
     def _collect_all_settings(self) -> dict:
         settings = {}
@@ -326,6 +354,8 @@ class L2MAutoKeyApp:
         settings.update(self.tab_daily.collect_settings())
         if self.tab_dungeon:
             settings.update(self.tab_dungeon.collect_settings())
+        settings["hotkey_start"] = self.hotkey_start_combo.get()
+        settings["hotkey_stop"] = self.hotkey_stop_combo.get()
         return settings
 
     # ──────────────────────────────────────────────
@@ -4871,7 +4901,54 @@ class L2MAutoKeyApp:
             self._log(f"[Test Region] Error: {e}")
 
     def _on_close(self):
+        self._teardown_hotkeys()
         if self.is_running:
             self.stop_all()
             time.sleep(0.5)
         self.root.destroy()
+
+    # ──────────────────────────────────────────────
+    #  Global hotkeys (work even when game is focused)
+    # ──────────────────────────────────────────────
+
+    def _setup_hotkeys(self):
+        """Register global hotkeys using keyboard library."""
+        self._teardown_hotkeys()
+        try:
+            import keyboard
+            start_key = self.hotkey_start_combo.get()
+            stop_key = self.hotkey_stop_combo.get()
+            if start_key:
+                hid = keyboard.add_hotkey(start_key, self._hotkey_start_pressed, suppress=False)
+                self._hotkey_ids.append(hid)
+            if stop_key:
+                hid = keyboard.add_hotkey(stop_key, self._hotkey_stop_pressed, suppress=False)
+                self._hotkey_ids.append(hid)
+            keys_str = f"Start={start_key or 'none'}, Stop={stop_key or 'none'}"
+            print(f"[Hotkey] Registered: {keys_str}")
+        except Exception as e:
+            print(f"[Hotkey] Setup error: {e}")
+
+    def _teardown_hotkeys(self):
+        """Unregister all global hotkeys."""
+        try:
+            import keyboard
+            for hid in self._hotkey_ids:
+                keyboard.remove_hotkey(hid)
+        except Exception:
+            pass
+        self._hotkey_ids.clear()
+
+    def _on_hotkey_changed(self, event=None):
+        """Re-register hotkeys when user changes selection."""
+        self._setup_hotkeys()
+
+    def _hotkey_start_pressed(self):
+        """Global hotkey callback — start bot (thread-safe via root.after)."""
+        if not self.is_running:
+            self.root.after(0, self.start_all)
+
+    def _hotkey_stop_pressed(self):
+        """Global hotkey callback — stop bot (thread-safe via root.after)."""
+        if self.is_running:
+            self.root.after(0, self.stop_all)
