@@ -1468,32 +1468,25 @@ class L2MAutoKeyApp:
         # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
         # If never becomes usable within timeout, skip skill entirely — just TP.
         if skill_key:
-            # Reset state tracker so first check of this CE always saves screenshot
+            # Full reset skill detection state — clean slate each CE
             self._last_skill_grayed_state = None
             self._last_skill_save_ts = 0
+            self._consecutive_active_reads = 0
             freeze_start = time.time()
-            FREEZE_TIMEOUT = 10.0  # increased from 5s — enemy freeze can last 5-8s in practice
+            FREEZE_TIMEOUT = 10.0
             waiting_logged = False
             skill_cast_done = False
-
-            consecutive_active = 0
-            ACTIVE_CONFIRM = 2  # require 2 consecutive "active" reads to prevent flip-flop
 
             while (time.time() - freeze_start) < FREEZE_TIMEOUT:
                 if self.stop_event.is_set():
                     return
                 if self._is_skill_grayed(skill_slot):
-                    consecutive_active = 0
                     if not waiting_logged:
                         self._log(f"[CE] Skill slot {skill_slot} grayed → di-freeze musuh, menunggu (max {FREEZE_TIMEOUT:.0f}s)...")
                         waiting_logged = True
                     time.sleep(0.03)
                     continue
-                consecutive_active += 1
-                if consecutive_active < ACTIVE_CONFIRM:
-                    time.sleep(0.03)
-                    continue
-                # Confirmed active — cast
+                # _is_skill_grayed already has 2-consecutive-active hysteresis
                 if waiting_logged:
                     self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s, Skill 2x")
                 else:
@@ -1580,9 +1573,11 @@ class L2MAutoKeyApp:
                 self.key_sender.send(potion_key)
                 time.sleep(0.4)
 
-        # Reset potion state — prevent false trigger after combat escape
+        # Reset all CE/skill state — clean for next CE cycle
         self._potion_low_count = 0
         self._potion_last_check = time.time()
+        self._last_skill_grayed_state = None
+        self._consecutive_active_reads = 0
 
     # ──────────────────────────────────────────────
     #  HP-based actions
@@ -4753,6 +4748,9 @@ class L2MAutoKeyApp:
         self.do_auto_hunt = False
         self._potion_low_count = 0
         self._potion_buy_active = False
+        self._last_skill_grayed_state = None
+        self._consecutive_active_reads = 0
+        self._last_skill_save_ts = 0
         self._log("[TP] Teleport selesai — semua feature direset")
 
         if not self.key_sender:
