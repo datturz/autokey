@@ -1476,33 +1476,44 @@ class L2MAutoKeyApp:
             waiting_logged = False
             skill_cast_done = False
 
+            consecutive_active = 0
+            ACTIVE_CONFIRM = 2  # require 2 consecutive "active" reads to prevent flip-flop
+
             while (time.time() - freeze_start) < FREEZE_TIMEOUT:
                 if self.stop_event.is_set():
                     return
                 if self._is_skill_grayed(skill_slot):
+                    consecutive_active = 0
                     if not waiting_logged:
                         self._log(f"[CE] Skill slot {skill_slot} grayed → di-freeze musuh, menunggu (max {FREEZE_TIMEOUT:.0f}s)...")
                         waiting_logged = True
                     time.sleep(0.03)
                     continue
-                # Active — cast immediately
+                consecutive_active += 1
+                if consecutive_active < ACTIVE_CONFIRM:
+                    time.sleep(0.03)
+                    continue
+                # Confirmed active — cast
                 if waiting_logged:
                     self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s, Skill 2x")
                 else:
                     self._log(f"[CE] Skill 2x")
                 self.key_sender.send(skill_key)
-                time.sleep(0.07)  # 70ms inter-press — sweet spot for cast activation
+                time.sleep(0.07)
                 self.key_sender.send(skill_key)
                 skill_cast_done = True
                 break
 
             if skill_cast_done:
-                # Step 3: WAIT for cast register server-side
-                time.sleep(0.5)
-                # Step 4: Cancel 2x BURST — ZERO GAP (v1.5 pattern)
-                self._log(f"[CE] Cancel skill")
-                self.key_sender.send(skill_key)  # cancel 1
-                self.key_sender.send(skill_key)  # cancel 2 (no gap)
+                # Step 3: WAIT for skill to fully activate (stun immunity)
+                time.sleep(1.5)
+                # Step 4: Cancel 3x with small gap
+                self._log(f"[CE] Cancel skill 3x")
+                self.key_sender.send(skill_key)
+                time.sleep(0.05)
+                self.key_sender.send(skill_key)
+                time.sleep(0.05)
+                self.key_sender.send(skill_key)
             else:
                 self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill")
 
