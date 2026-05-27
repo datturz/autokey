@@ -259,8 +259,8 @@ def check_for_updates(parent: tk.Tk, force: bool = False):
 
 
 def schedule_periodic_check(root: tk.Tk):
-    """Run an update check on startup (respects 24h gate), then every 24h."""
-    check_for_updates(root, force=False)
+    """Run an update check on every startup (force), then every 24h while running."""
+    check_for_updates(root, force=True)
 
     def tick():
         check_for_updates(root, force=True)
