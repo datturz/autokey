@@ -1516,7 +1516,7 @@ class L2MAutoKeyApp:
         arrived = False
         tp_start = time.time()
         TP_TIMEOUT = 60.0
-        BURST_SIZE = 10
+        BURST_SIZE = 20
         burst_round = 0
         while (time.time() - tp_start) < TP_TIMEOUT:
             if self.stop_event.is_set():
