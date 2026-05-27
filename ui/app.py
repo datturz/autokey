@@ -1382,31 +1382,7 @@ class L2MAutoKeyApp:
             return False
 
         # Decision: which template has LOWER pixel difference (better match)
-        # If crop pixels match grayed template better → skill is frozen → wait
-        is_grayed_raw = diff_grayed < diff_active
-
-        # HYSTERESIS: in dark scenes (Darkness debuff), MAD/SSIM values become
-        # noisy and frame-by-frame classification can flip-flop. To prevent
-        # premature cast when skill is actually still grayed, require 2
-        # consecutive "active" reads before clearing the grayed state.
-        # Transition TO grayed is immediate (be cautious — don't cast on noise).
-        last_state = getattr(self, '_last_skill_grayed_state', None)
-        if last_state is True and not is_grayed_raw:
-            # Was grayed, now reads active — need consecutive confirmation
-            consec = getattr(self, '_consecutive_active_reads', 0) + 1
-            self._consecutive_active_reads = consec
-            if consec < 2:
-                # Not yet confirmed — keep grayed to be safe
-                is_grayed = True
-            else:
-                # 2 consecutive active reads → confirmed clear
-                is_grayed = False
-                self._consecutive_active_reads = 0
-        else:
-            is_grayed = is_grayed_raw
-            if is_grayed_raw:
-                # Reset counter when grayed (so any future active needs 2 consec)
-                self._consecutive_active_reads = 0
+        is_grayed = diff_grayed < diff_active
 
         # Save debug screenshot: on state transition OR every ~2s
         last_state = getattr(self, '_last_skill_grayed_state', None)
@@ -1462,7 +1438,7 @@ class L2MAutoKeyApp:
         if weapon_key:
             self._log(f"[CE] Weapon: {weapon_key}")
             self.key_sender.send(weapon_key)
-            time.sleep(0.1)  # reduced from 0.3s — game UI update is fast
+            time.sleep(0.3)  # let game UI settle before reading skill state
 
         # Step 2: Check skill state immediately after weapon switch.
         # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
@@ -1471,7 +1447,6 @@ class L2MAutoKeyApp:
             # Full reset skill detection state — clean slate each CE
             self._last_skill_grayed_state = None
             self._last_skill_save_ts = 0
-            self._consecutive_active_reads = 0
             freeze_start = time.time()
             FREEZE_TIMEOUT = 10.0
             waiting_logged = False
@@ -1577,7 +1552,6 @@ class L2MAutoKeyApp:
         self._potion_low_count = 0
         self._potion_last_check = time.time()
         self._last_skill_grayed_state = None
-        self._consecutive_active_reads = 0
 
     # ──────────────────────────────────────────────
     #  HP-based actions
@@ -4749,7 +4723,6 @@ class L2MAutoKeyApp:
         self._potion_low_count = 0
         self._potion_buy_active = False
         self._last_skill_grayed_state = None
-        self._consecutive_active_reads = 0
         self._last_skill_save_ts = 0
         self._log("[TP] Teleport selesai — semua feature direset")
 
