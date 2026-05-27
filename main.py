@@ -162,7 +162,7 @@ def _check_license_silent(code: str, hwid: str) -> tuple[bool, str]:
         if not resp.data:
             return False, "Code tidak valid"
         lic = resp.data[0]
-        if not lic.get("is_active", False):
+        if lic.get("is_active") is False:
             return False, "Code dinonaktifkan"
         expires_str = lic.get("expires_at", "")
         if expires_str:
@@ -187,6 +187,7 @@ def _check_license_silent(code: str, hwid: str) -> tuple[bool, str]:
         if not stored_hwid:
             client.table("licenses").update({
                 "hwid": hwid,
+                "is_active": True,
                 "activated_at": datetime.now(timezone.utc).isoformat()
             }).eq("code", code).execute()
         return True, "Valid"
@@ -234,8 +235,8 @@ def validate_license() -> bool:
 
             license_data = resp.data[0]
 
-            # Check is_active
-            if not license_data.get("is_active", False):
+            # Check is_active (only reject if explicitly False, null = active)
+            if license_data.get("is_active") is False:
                 status_label.config(text="Code dinonaktifkan!", foreground="red")
                 return False
 
@@ -258,6 +259,7 @@ def validate_license() -> bool:
                 try:
                     client.table("licenses").update({
                         "hwid": hwid,
+                        "is_active": True,
                         "activated_at": datetime.now(timezone.utc).isoformat()
                     }).eq("code", code).execute()
                     status_label.config(text="Aktivasi berhasil!", foreground="green")
