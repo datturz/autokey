@@ -1502,12 +1502,9 @@ class L2MAutoKeyApp:
 
             # Step 3: WAIT for skill to fully activate (stun immunity)
             time.sleep(1.5)
-            # Step 4: Cancel 3x with small gap
-            self._log(f"[CE] Cancel skill 3x")
+            # Step 4: Cancel 2x BURST — ZERO GAP, langsung lanjut ke TP
+            self._log(f"[CE] Cancel skill")
             self.key_sender.send(skill_key)
-            time.sleep(0.05)
-            self.key_sender.send(skill_key)
-            time.sleep(0.05)
             self.key_sender.send(skill_key)
 
         # Step 5: Burst TP until town detected (NPC list / shop icon muncul)
