@@ -445,6 +445,7 @@ class L2MAutoKeyApp:
         import threading
         self._feature_lock = threading.Lock()
         self._feature_active = ""  # Name of currently running feature
+        self._feature_lock_at = 0  # Timestamp when lock was acquired (safety timeout)
 
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -1033,6 +1034,13 @@ class L2MAutoKeyApp:
                 except Exception:
                     pass
 
+                # Safety: auto-reset stuck CE state after 120s
+                if self._combat_escape_triggered and (now - self._combat_escape_last_at) > 120:
+                    self._log("[CE] Auto-reset stuck CE state (>120s)")
+                    self._combat_escape_triggered = False
+                    self._combat_escape_last_at = 0
+                    self._escaped_to_town_at = 0
+
                 # Store image for other threads
                 self._last_img_for_checks = img
 
@@ -1146,19 +1154,30 @@ class L2MAutoKeyApp:
 
     def _acquire_feature(self, name: str, timeout: float = 0.5) -> bool:
         """Try to acquire the feature lock. Returns True if acquired.
-        If another feature is running, waits up to timeout seconds."""
+        Safety: force-release if held >20s (prevent stuck lock from dead thread)."""
+        held_since = getattr(self, '_feature_lock_at', 0)
+        if held_since > 0 and (time.time() - held_since) > 20:
+            self._log(f"[LOCK] Force-release stuck lock (held by {self._feature_active} for >{time.time()-held_since:.0f}s)")
+            self._feature_active = ""
+            self._feature_lock_at = 0
+            try:
+                self._feature_lock.release()
+            except RuntimeError:
+                pass
         acquired = self._feature_lock.acquire(timeout=timeout)
         if acquired:
             self._feature_active = name
+            self._feature_lock_at = time.time()
         return acquired
 
     def _release_feature(self):
         """Release the feature lock."""
         self._feature_active = ""
+        self._feature_lock_at = 0
         try:
             self._feature_lock.release()
         except RuntimeError:
-            pass  # Already released
+            pass
 
     def _is_feature_busy(self) -> bool:
         """Check if any feature is currently running."""
@@ -1179,10 +1198,15 @@ class L2MAutoKeyApp:
 
         now = time.time()
 
-        # Long cooldown: prevent re-trigger right after a successful CE
+        # Cooldown: prevent re-trigger right after a successful CE.
+        # Safety: if CE state is already clean (not triggered, not escaped),
+        # clear stale cooldown so next CE can fire immediately.
         last_ce = getattr(self, '_combat_escape_last_at', 0)
         if last_ce > 0 and (now - last_ce) < 60:
-            return
+            if not self._combat_escape_triggered and self._escaped_to_town_at == 0:
+                self._combat_escape_last_at = 0
+            else:
+                return
 
         # Short cooldown — faster re-detection (was 3s)
         if (now - getattr(self, '_combat_icon_escape_last_at', 0)) < 1:
@@ -1444,46 +1468,47 @@ class L2MAutoKeyApp:
         # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
         # If never becomes usable within timeout, skip skill entirely — just TP.
         if skill_key:
-            # Full reset skill detection state — clean slate each CE
             self._last_skill_grayed_state = None
             self._last_skill_save_ts = 0
             freeze_start = time.time()
-            FREEZE_TIMEOUT = 10.0
+            FREEZE_TIMEOUT = 3.0
             waiting_logged = False
-            skill_cast_done = False
+            cleared = False
 
             while (time.time() - freeze_start) < FREEZE_TIMEOUT:
                 if self.stop_event.is_set():
                     return
                 if self._is_skill_grayed(skill_slot):
                     if not waiting_logged:
-                        self._log(f"[CE] Skill slot {skill_slot} grayed → di-freeze musuh, menunggu (max {FREEZE_TIMEOUT:.0f}s)...")
+                        self._log(f"[CE] Skill slot {skill_slot} grayed → freeze, menunggu (max {FREEZE_TIMEOUT:.0f}s)...")
                         waiting_logged = True
                     time.sleep(0.03)
                     continue
-                # _is_skill_grayed already has 2-consecutive-active hysteresis
+                cleared = True
                 if waiting_logged:
-                    self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s, Skill 2x")
-                else:
-                    self._log(f"[CE] Skill 2x")
-                self.key_sender.send(skill_key)
-                time.sleep(0.07)
-                self.key_sender.send(skill_key)
-                skill_cast_done = True
+                    self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s")
                 break
 
-            if skill_cast_done:
-                # Step 3: WAIT for skill to fully activate (stun immunity)
-                time.sleep(1.5)
-                # Step 4: Cancel 3x with small gap
-                self._log(f"[CE] Cancel skill 3x")
-                self.key_sender.send(skill_key)
-                time.sleep(0.05)
-                self.key_sender.send(skill_key)
-                time.sleep(0.05)
-                self.key_sender.send(skill_key)
-            else:
-                self._log(f"[CE] Skill wait timeout {FREEZE_TIMEOUT:.0f}s, skip skill")
+            if not cleared:
+                self._log(f"[CE] Freeze timeout {FREEZE_TIMEOUT:.0f}s → force-cast skill")
+
+            # Cast skill 3x (more presses = higher chance to register)
+            self._log(f"[CE] Skill 3x")
+            self.key_sender.send(skill_key)
+            time.sleep(0.07)
+            self.key_sender.send(skill_key)
+            time.sleep(0.07)
+            self.key_sender.send(skill_key)
+
+            # Step 3: WAIT for skill to fully activate (stun immunity)
+            time.sleep(1.5)
+            # Step 4: Cancel 3x with small gap
+            self._log(f"[CE] Cancel skill 3x")
+            self.key_sender.send(skill_key)
+            time.sleep(0.05)
+            self.key_sender.send(skill_key)
+            time.sleep(0.05)
+            self.key_sender.send(skill_key)
 
         # Step 5: Burst TP until town detected (NPC list / shop icon muncul)
         self._log(f"[CE] Burst TP '{tp_key}' sampai di kota...")
