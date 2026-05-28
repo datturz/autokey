@@ -1342,14 +1342,11 @@ class L2MAutoKeyApp:
                     pass
 
     def _is_skill_grayed(self, slot_num: int, img=None) -> bool:
-        """Detect if skill slot icon is grayed out (frozen by enemy debuff).
+        """Detect if skill slot icon is grayed (frozen by enemy debuff).
 
-        Uses SSIM (Structural Similarity Index) against active/grayed templates.
-        SSIM compares structure/luminance/contrast — robust to brightness shifts
-        and background noise. Score 0.0-1.0; the template with higher score wins.
+        Fast MAD-only comparison — no SSIM, no disk I/O. ~5-15ms per call.
+        Decision: crop pixels closer (lower MAD) to grayed template = frozen.
         """
-        from skimage.metrics import structural_similarity as ssim
-
         if img is None:
             if not self.capturer:
                 return False
@@ -1357,15 +1354,21 @@ class L2MAutoKeyApp:
             if img is None:
                 return False
 
-        # Get configured region from CE settings
-        try:
-            ce_settings = self.tab_farming.collect_settings()
-            x1_pct = float(ce_settings.get("combat_escape_skill_x1", 70.6))
-            y1_pct = float(ce_settings.get("combat_escape_skill_y1", 92.5))
-            x2_pct = float(ce_settings.get("combat_escape_skill_x2", 74.1))
-            y2_pct = float(ce_settings.get("combat_escape_skill_y2", 98.6))
-        except Exception:
-            x1_pct, y1_pct, x2_pct, y2_pct = 70.6, 92.5, 74.1, 98.6
+        # Get configured region from CE settings (cached to avoid UI-thread call per loop iter)
+        cached = getattr(self, '_skill_region_cache', None)
+        if cached is None:
+            try:
+                ce_settings = self.tab_farming.collect_settings()
+                cached = (
+                    float(ce_settings.get("combat_escape_skill_x1", 70.6)),
+                    float(ce_settings.get("combat_escape_skill_y1", 92.5)),
+                    float(ce_settings.get("combat_escape_skill_x2", 74.1)),
+                    float(ce_settings.get("combat_escape_skill_y2", 98.6)),
+                )
+            except Exception:
+                cached = (70.6, 92.5, 74.1, 98.6)
+            self._skill_region_cache = cached
+        x1_pct, y1_pct, x2_pct, y2_pct = cached
 
         w, h = img.size
         sx1 = max(0, int(w * x1_pct / 100.0))
@@ -1388,15 +1391,7 @@ class L2MAutoKeyApp:
             gh, gw = self._skill_grayed_gray.shape[:2]
             crop_a = cv2.resize(crop_gray, (aw, ah), interpolation=cv2.INTER_AREA)
             crop_g = cv2.resize(crop_gray, (gw, gh), interpolation=cv2.INTER_AREA)
-            # SSIM kept for diagnostic only
-            score_active = float(ssim(crop_a, self._skill_active_gray, data_range=255))
-            score_grayed = float(ssim(crop_g, self._skill_grayed_gray, data_range=255))
-            # PIXEL-WISE MEAN ABSOLUTE DIFFERENCE (MAD) — primary signal
-            # Computes |crop - template| at each pixel, averages.
-            # Lower MAD = closer pixel-by-pixel match = use that template.
-            # More robust than brightness-only because it captures FULL spatial
-            # pattern (shield highlight positions, dim areas, etc.) not just
-            # average brightness which scene lighting can fool.
+            # Fast MAD-only decision (SSIM removed — was ~50ms overhead per call)
             diff_active = float(np.mean(np.abs(
                 crop_a.astype(np.int16) - self._skill_active_gray.astype(np.int16))))
             diff_grayed = float(np.mean(np.abs(
@@ -1405,36 +1400,11 @@ class L2MAutoKeyApp:
             print(f"[CE/Freeze] check error: {e}")
             return False
 
-        # Decision: which template has LOWER pixel difference (better match)
         is_grayed = diff_grayed < diff_active
-
-        # Save debug screenshot: on state transition OR every ~2s
-        last_state = getattr(self, '_last_skill_grayed_state', None)
-        last_save = getattr(self, '_last_skill_save_ts', 0)
-        now_ts = time.time()
-        should_save = (last_state is None
-                       or last_state != is_grayed
-                       or (now_ts - last_save) >= 2.0)
-        if should_save:
-            try:
-                if hasattr(sys, '_MEIPASS'):
-                    base = os.path.dirname(sys.executable)
-                else:
-                    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                log_dir = os.path.join(base, "skill_state_logs")
-                os.makedirs(log_dir, exist_ok=True)
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                state_str = "GRAYED" if is_grayed else "ACTIVE"
-                fname = f"{ts}_slot{slot_num}_{state_str}_A{score_active:.2f}_G{score_grayed:.2f}.png"
-                crop.save(os.path.join(log_dir, fname))
-                self._last_skill_save_ts = now_ts
-            except Exception:
-                pass
         self._last_skill_grayed_state = is_grayed
 
         try:
-            print(f"[CE/Freeze] Slot {slot_num} MAD active={diff_active:.1f} grayed={diff_grayed:.1f} "
-                  f"(SSIM a={score_active:.3f} g={score_grayed:.3f}) → grayed={is_grayed}")
+            print(f"[CE/Freeze] Slot {slot_num} MAD active={diff_active:.1f} grayed={diff_grayed:.1f} → grayed={is_grayed}")
         except Exception:
             pass
         return is_grayed
@@ -1470,6 +1440,7 @@ class L2MAutoKeyApp:
         if skill_key:
             self._last_skill_grayed_state = None
             self._last_skill_save_ts = 0
+            self._skill_region_cache = None  # refresh region from settings each CE
             freeze_start = time.time()
             FREEZE_TIMEOUT = 3.0
             waiting_logged = False
