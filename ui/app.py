@@ -1434,36 +1434,32 @@ class L2MAutoKeyApp:
             self.key_sender.send(weapon_key)
             time.sleep(0.1)  # game UI update is fast — minimal gap to skill cast
 
-        # Step 2: Check skill state immediately after weapon switch.
-        # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
-        # If never becomes usable within timeout, skip skill entirely — just TP.
+        # Step 2: Quick check — if NOT grayed, cast immediately (no wait).
+        # Only wait if confirmed grayed (frozen by enemy).
         if skill_key:
             self._last_skill_grayed_state = None
-            self._last_skill_save_ts = 0
             self._skill_region_cache = None  # refresh region from settings each CE
-            freeze_start = time.time()
-            FREEZE_TIMEOUT = 3.0
-            waiting_logged = False
-            cleared = False
 
-            while (time.time() - freeze_start) < FREEZE_TIMEOUT:
-                if self.stop_event.is_set():
-                    return
-                if self._is_skill_grayed(skill_slot):
-                    if not waiting_logged:
-                        self._log(f"[CE] Skill slot {skill_slot} grayed → freeze, menunggu (max {FREEZE_TIMEOUT:.0f}s)...")
-                        waiting_logged = True
-                    time.sleep(0.03)
-                    continue
-                cleared = True
-                if waiting_logged:
-                    self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s")
-                break
+            # Single check using main loop's cached image (zero capture cost)
+            cached_img = getattr(self, '_last_img_for_checks', None)
+            is_grayed = self._is_skill_grayed(skill_slot, img=cached_img)
 
-            if not cleared:
-                self._log(f"[CE] Freeze timeout {FREEZE_TIMEOUT:.0f}s → force-cast skill")
+            if is_grayed:
+                # Frozen → short wait loop (max 2s) before force-cast
+                self._log(f"[CE] Skill slot {skill_slot} grayed → freeze, menunggu (max 2s)...")
+                freeze_start = time.time()
+                FREEZE_TIMEOUT = 2.0
+                while (time.time() - freeze_start) < FREEZE_TIMEOUT:
+                    if self.stop_event.is_set():
+                        return
+                    time.sleep(0.05)
+                    if not self._is_skill_grayed(skill_slot):
+                        self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s")
+                        break
+                else:
+                    self._log(f"[CE] Freeze timeout 2s → force-cast")
 
-            # Cast skill 3x (more presses = higher chance to register)
+            # Cast skill 3x (immediate if not grayed; otherwise after wait)
             self._log(f"[CE] Skill 3x")
             self.key_sender.send(skill_key)
             time.sleep(0.07)
