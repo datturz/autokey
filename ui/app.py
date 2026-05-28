@@ -1462,7 +1462,7 @@ class L2MAutoKeyApp:
         if weapon_key:
             self._log(f"[CE] Weapon: {weapon_key}")
             self.key_sender.send(weapon_key)
-            time.sleep(0.3)  # let game UI settle before reading skill state
+            time.sleep(0.1)  # game UI update is fast — minimal gap to skill cast
 
         # Step 2: Check skill state immediately after weapon switch.
         # If grayed (frozen by enemy) → wait in tight poll until active, then cast.
