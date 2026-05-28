@@ -20,6 +20,7 @@ from version import APP_VERSION
 GITHUB_REPO = "datturz/autokey"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 CHECK_INTERVAL_SECONDS = 24 * 3600  # 24 hours
+UPDATE_COOLDOWN_SECONDS = 6 * 3600  # skip auto-prompt for same version after failed install
 
 
 def _get_check_cache_path() -> str:
@@ -29,6 +30,42 @@ def _get_check_cache_path() -> str:
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, ".update_check")
+
+
+def _get_update_state_path() -> str:
+    """Path to update attempt tracker (in LOCALAPPDATA — non-OneDrive)."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "L2M_AutoKey")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "update_state.json")
+
+
+def _load_update_attempt() -> dict:
+    try:
+        with open(_get_update_state_path(), "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_update_attempt(version: str):
+    try:
+        with open(_get_update_state_path(), "w") as f:
+            json.dump({"version": version, "ts": time.time()}, f)
+    except Exception:
+        pass
+
+
+def _should_skip_update(version: str) -> bool:
+    """Skip auto-prompt if we attempted this same version <6h ago (failed install)."""
+    state = _load_update_attempt()
+    if state.get("version") != version:
+        return False
+    elapsed = time.time() - state.get("ts", 0)
+    if elapsed < UPDATE_COOLDOWN_SECONDS:
+        print(f"[Updater] Skip v{version} — last attempt {elapsed/60:.0f}m ago (<6h cooldown)")
+        return True
+    return False
 
 
 def _load_last_check_ts() -> float:
@@ -111,8 +148,8 @@ def _download_with_progress(url: str, dest: str, progress_cb=None) -> bool:
         return False
 
 
-def _install_update(temp_file: str, parent=None):
-    """Replace current exe with downloaded one via batch script, then exit."""
+def _install_update(temp_file: str, version: str = "", parent=None):
+    """Replace current exe via PowerShell (handles OneDrive/Defender locks)."""
     if not getattr(sys, 'frozen', False):
         messagebox.showinfo(
             "Update",
@@ -121,30 +158,43 @@ def _install_update(temp_file: str, parent=None):
         )
         return
 
+    # Record attempt — if install fails, 6h cooldown prevents re-prompt loop
+    if version:
+        _save_update_attempt(version)
+
     current_exe = sys.executable
     exe_name = os.path.basename(current_exe)
     exe_dir = os.path.dirname(current_exe)
+    proc_name = os.path.splitext(exe_name)[0]
     batch_file = os.path.join(exe_dir, "update_l2m_autokey.bat")
+
+    # PowerShell installer: Move-Item -Force handles locked files via atomic
+    # rename (works on locked exe), then copy new. 30 retries with 2s backoff.
+    ps_script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        f"$cur='{current_exe}';$tmp='{temp_file}';$old='{current_exe}.old';"
+        "if(Test-Path $old){Remove-Item $old -Force};"
+        "$ok=$false;"
+        "for($i=0;$i -lt 30 -and -not $ok;$i++){"
+        "  try{"
+        "    if(Test-Path $cur){Move-Item -Path $cur -Destination $old -Force -ErrorAction Stop};"
+        "    Copy-Item -Path $tmp -Destination $cur -Force -ErrorAction Stop;"
+        "    $ok=$true;"
+        "  }catch{"
+        "    Start-Sleep -Seconds 2;"
+        f"    Get-Process -Name '{proc_name}' -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue;"
+        "  }"
+        "};"
+        "if(Test-Path $old){Remove-Item $old -Force};"
+        "if(Test-Path $tmp){Remove-Item $tmp -Force};"
+        "if($ok){Start-Process -FilePath $cur}"
+    )
     batch_content = f'''@echo off
-echo Waiting for application to close...
-timeout /t 5 /nobreak > nul
+timeout /t 2 /nobreak > nul
 taskkill /f /im "{exe_name}" >nul 2>&1
 timeout /t 3 /nobreak > nul
-
-:retry
-echo Copying update...
-copy /y "{temp_file}" "{current_exe}"
-if errorlevel 1 (
-    echo Copy failed, retrying in 5 seconds...
-    taskkill /f /im "{exe_name}" >nul 2>&1
-    timeout /t 5 /nobreak > nul
-    goto retry
-)
-del "{temp_file}" 2>nul
-echo Starting updated application...
-cd /d "{exe_dir}"
-start "" "{current_exe}"
-timeout /t 3 /nobreak > nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "{ps_script}"
+timeout /t 2 /nobreak > nul
 del "%~f0"
 '''
     with open(batch_file, 'w') as f:
@@ -223,7 +273,7 @@ def _prompt_and_download(parent, latest: str, download_url: str):
             "Download selesai. Aplikasi akan restart sekarang.",
             parent=parent,
         )
-        _install_update(temp_file, parent=parent)
+        _install_update(temp_file, version=latest, parent=parent)
     else:
         messagebox.showerror(
             "Update Gagal",
@@ -252,6 +302,8 @@ def check_for_updates(parent: tk.Tk, force: bool = False):
         print(f"[Updater] Latest=v{latest}, current=v{APP_VERSION}")
         if not _is_newer(APP_VERSION, latest):
             print("[Updater] Already on latest version")
+            return
+        if _should_skip_update(latest):
             return
         parent.after(0, lambda: _prompt_and_download(parent, latest, download_url))
 
