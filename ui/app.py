@@ -1341,6 +1341,69 @@ class L2MAutoKeyApp:
                 except Exception:
                     pass
 
+    def _is_self_popup_open(self, img=None) -> bool:
+        """Detect if SELF confirm popup is open on a skill slot.
+
+        Skill needs self-targeting → pressing skill once opens SELF button overlay,
+        pressing again confirms cast. If frozen between presses, popup stays stuck.
+        Region: 73-82% x, 88-96% y (bottom-right hotbar). Uses template matching.
+        """
+        if img is None:
+            if not self.capturer:
+                return False
+            img = self.capturer.capture()
+            if img is None:
+                return False
+
+        # Lazy-load template (multi-scale cache for resolution-independence)
+        if not getattr(self, '_self_popup_loaded', False):
+            self._self_popup_loaded = True
+            self._self_popup_cache = []
+            path = os.path.join("assets", "self_popup.png")
+            if os.path.exists(path):
+                try:
+                    tpl_bgr, _ = load_image(path)
+                    tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+                    for scale in (0.5, 0.667, 0.833, 1.0, 1.25):
+                        th, tw = tpl_gray.shape[:2]
+                        nw = max(10, int(tw * scale))
+                        nh = max(10, int(th * scale))
+                        self._self_popup_cache.append(
+                            cv2.resize(tpl_gray, (nw, nh), interpolation=cv2.INTER_AREA)
+                        )
+                except Exception as e:
+                    print(f"[CE/Self] template load error: {e}")
+
+        if not self._self_popup_cache:
+            return False
+
+        try:
+            w, h = img.size
+            # Bottom-right hotbar region (a bit wider than exact template position)
+            rx1 = int(w * 0.70)
+            ry1 = int(h * 0.85)
+            rx2 = int(w * 0.85)
+            ry2 = int(h * 0.99)
+            crop = img.crop((rx1, ry1, rx2, ry2))
+            crop_arr = np.array(crop)
+            crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
+            sh, sw = crop_gray.shape[:2]
+            best = 0.0
+            for tpl in self._self_popup_cache:
+                th, tw = tpl.shape[:2]
+                if th > sh or tw > sw:
+                    continue
+                res = cv2.matchTemplate(crop_gray, tpl, cv2.TM_CCOEFF_NORMED)
+                _, mx, _, _ = cv2.minMaxLoc(res)
+                if mx > best:
+                    best = mx
+                    if best >= 0.85:
+                        break
+            return best >= 0.70
+        except Exception as e:
+            print(f"[CE/Self] check error: {e}")
+            return False
+
     def _is_skill_grayed(self, slot_num: int, img=None) -> bool:
         """Detect if skill slot icon is grayed (frozen by enemy debuff).
 
@@ -1466,6 +1529,22 @@ class L2MAutoKeyApp:
             self.key_sender.send(skill_key)
             time.sleep(0.07)
             self.key_sender.send(skill_key)
+
+            # SELF popup retry — if popup still open, skill didn't actually cast
+            # (got frozen mid-cast etc). Keep pressing until popup gone or max retries.
+            for attempt in range(8):
+                time.sleep(0.15)
+                if self.stop_event.is_set():
+                    return
+                if not self._is_self_popup_open():
+                    if attempt > 0:
+                        self._log(f"[CE] SELF popup confirmed after {attempt+1} retry")
+                    break
+                self._log(f"[CE] SELF popup still open → retry {attempt+1}/8")
+                self.key_sender.send(skill_key)
+                self.key_sender.send(skill_key)
+            else:
+                self._log(f"[CE] SELF popup stuck after 8 retries → continue anyway")
 
             # Step 3: WAIT for skill to fully activate (stun immunity)
             time.sleep(1.5)
