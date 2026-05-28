@@ -1503,9 +1503,9 @@ class L2MAutoKeyApp:
             self._last_skill_grayed_state = None
             self._skill_region_cache = None  # refresh region from settings each CE
 
-            # Single check using main loop's cached image (zero capture cost)
-            cached_img = getattr(self, '_last_img_for_checks', None)
-            is_grayed = self._is_skill_grayed(skill_slot, img=cached_img)
+            # Fresh capture — cached_img may be from BEFORE weapon switch (stale)
+            # which causes false-positive grayed for the new weapon's skill icon.
+            is_grayed = self._is_skill_grayed(skill_slot, img=None)
 
             if is_grayed:
                 # Frozen → short wait loop (max 2s) before force-cast
@@ -1530,19 +1530,19 @@ class L2MAutoKeyApp:
             time.sleep(0.07)
             self.key_sender.send(skill_key)
 
-            # SELF popup retry — if popup still open, skill didn't actually cast
-            # (got frozen mid-cast etc). Keep pressing until popup gone or max retries.
+            # SELF popup retry — check IMMEDIATELY first (normal case popup is
+            # already gone after press 2 confirm). Only wait+retry if stuck.
             for attempt in range(8):
-                time.sleep(0.15)
                 if self.stop_event.is_set():
                     return
                 if not self._is_self_popup_open():
                     if attempt > 0:
-                        self._log(f"[CE] SELF popup confirmed after {attempt+1} retry")
+                        self._log(f"[CE] SELF popup confirmed after {attempt} retry")
                     break
                 self._log(f"[CE] SELF popup still open → retry {attempt+1}/8")
                 self.key_sender.send(skill_key)
                 self.key_sender.send(skill_key)
+                time.sleep(0.15)
             else:
                 self._log(f"[CE] SELF popup stuck after 8 retries → continue anyway")
 
