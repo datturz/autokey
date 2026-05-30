@@ -96,6 +96,33 @@ class KeySender:
         except Exception as e:
             print(f"[KeySender] send error for '{char}': {e}")
 
+    def send_burst(self, chars, hold_time: float = 0.05, gap: float = 0.0):
+        """Send a sequence of keystrokes back-to-back with NO per-key prints.
+
+        Used for the zero-gap cancel→teleport burst: no logging/capture/assign
+        happens between keys, so there is no "hole" for an enemy hit to cancel
+        the teleport. hold_time is shorter than send() (0.1) to keep the
+        cancel→TP transition tight; `gap` adds optional spacing between keys.
+        """
+        for char in chars:
+            char = char.strip()
+            if not char:
+                continue
+            vk_code = self._char_to_vk(char)
+            if vk_code is None:
+                continue
+            scan_code = win32api.MapVirtualKey(vk_code, 0)
+            lparam_down = 1 | (scan_code << 16)
+            lparam_up = lparam_down | 0xC0000000
+            try:
+                win32api.PostMessage(self.hwnd, win32con.WM_KEYDOWN, vk_code, lparam_down)
+                time.sleep(hold_time)
+                win32api.PostMessage(self.hwnd, win32con.WM_KEYUP, vk_code, lparam_up)
+                if gap:
+                    time.sleep(gap)
+            except Exception as e:
+                print(f"[KeySender] send_burst error for '{char}': {e}")
+
     def send_down(self, char: str):
         """Send key DOWN (press without release). For WASD hold."""
         char = char.strip()

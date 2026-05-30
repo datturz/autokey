@@ -1548,13 +1548,11 @@ class L2MAutoKeyApp:
 
             # Step 3: WAIT for skill to fully activate (stun immunity)
             time.sleep(1.5)
-            # Step 4: Cancel 2x BURST — ZERO GAP, langsung lanjut ke TP
-            self._log(f"[CE] Cancel skill")
-            self.key_sender.send(skill_key)
-            self.key_sender.send(skill_key)
-
-        # Step 5: Burst TP until town detected (NPC list / shop icon muncul)
-        self._log(f"[CE] Burst TP '{tp_key}' sampai di kota...")
+        # Step 4+5: Cancel skill → Burst TP as ONE atomic sequence.
+        # ALL state + log are set BEFORE the key sequence so there is ZERO Python
+        # work (log/assign/capture) between cancel-keyup and the first TP-keydown
+        # — that gap was the "hole" where an enemy hit could cancel the teleport.
+        self._log(f"[CE] Cancel → Burst TP '{tp_key}' sampai di kota...")
         self._escaped_to_town_at = time.time()
         self.is_in_town = True
         self.last_in_town_time = time.time()
@@ -1564,18 +1562,37 @@ class L2MAutoKeyApp:
         tp_start = time.time()
         TP_TIMEOUT = 60.0
         BURST_SIZE = 20
+        BURST_HOLD = 0.05  # tight hold — cancel→TP mulus tanpa dead-air per key
         burst_round = 0
+
+        # First burst: cancel 2x (if skill set) IMMEDIATELY chained to TP burst —
+        # single send_burst call, no prints/sleeps in between = no hole.
+        first_seq = ([skill_key, skill_key] if skill_key else []) + [tp_key] * BURST_SIZE
+        self.key_sender.send_burst(first_seq, hold_time=BURST_HOLD)
+        burst_round += 1
+
         while (time.time() - tp_start) < TP_TIMEOUT:
             if self.stop_event.is_set():
                 return
-            # Burst: rapid fire TP (no delay between sends)
-            for _ in range(BURST_SIZE):
-                self.key_sender.send(tp_key)
-            burst_round += 1
-            # Check town after each burst
-            time.sleep(0.3)
+            # Check town between bursts
+            time.sleep(0.2)
             try:
                 img = self.capturer.capture() if self.capturer else None
+                # Died mid-escape? Death screen blocks TP. If we keep bursting we
+                # spam TP into the corpse for the full 60s timeout while the
+                # capture-loop death handler is STARVED (it cannot run until this
+                # blocking CE returns) → resurrect never clicked. So detect death
+                # HERE, click Resurrect, and bail so the normal death flow runs.
+                if img and self.hunting_checker.is_dead(img):
+                    self._log("[CE] Karakter MATI saat escape! Klik Resurrect (640,525)...")
+                    if self.clicker:
+                        self.clicker.click_scaled(640, 525)
+                    # Undo optimistic town state CE set — we're on the death
+                    # screen, not in town. Reset trigger so CE can fire again.
+                    self.is_in_town = False
+                    self._escaped_to_town_at = 0
+                    self._combat_escape_triggered = False
+                    return
                 if img and (self._check_in_town_by_shop_icon(img) or self._is_opening_shop(img)):
                     arrived = True
                     elapsed = time.time() - tp_start
@@ -1583,6 +1600,9 @@ class L2MAutoKeyApp:
                     break
             except Exception:
                 pass
+            # Next TP burst round (zero-gap internal)
+            self.key_sender.send_burst([tp_key] * BURST_SIZE, hold_time=BURST_HOLD)
+            burst_round += 1
 
         if not arrived:
             self._log(f"[CE] TP timeout {TP_TIMEOUT:.0f}s — town not detected, lanjut...")
