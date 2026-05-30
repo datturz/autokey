@@ -1495,22 +1495,43 @@ class L2MAutoKeyApp:
         if weapon_key:
             self._log(f"[CE] Weapon: {weapon_key}")
             self.key_sender.send(weapon_key)
-            # NO sleep — go straight to skill spam (zero gap)
+            time.sleep(0.1)  # game UI update is fast — minimal gap to skill cast
 
-        # Step 2: Rapid skill spam 5x — no pre-check, no delay.
-        # If frozen, keys are ignored; 5 presses = high chance one lands when freeze clears.
-        # SELF popup retry below catches the case where popup got stuck.
+        # Step 2: Quick check — if NOT grayed, cast immediately (no wait).
+        # Only wait if confirmed grayed (frozen by enemy).
         if skill_key:
-            self._log(f"[CE] Skill 5x rapid spam")
-            for i in range(5):
-                self.key_sender.send(skill_key)
-                if i < 4:
-                    time.sleep(0.03)  # 30ms between presses — fast but game-readable
-
-            # SELF popup retry — check immediately. If still open, skill didn't
-            # confirm (e.g. frozen mid-cast); spam more until popup gone.
             self._last_skill_grayed_state = None
-            self._skill_region_cache = None
+            self._skill_region_cache = None  # refresh region from settings each CE
+
+            # Fresh capture — cached_img may be from BEFORE weapon switch (stale)
+            # which causes false-positive grayed for the new weapon's skill icon.
+            is_grayed = self._is_skill_grayed(skill_slot, img=None)
+
+            if is_grayed:
+                # Frozen → short wait loop (max 2s) before force-cast
+                self._log(f"[CE] Skill slot {skill_slot} grayed → freeze, menunggu (max 2s)...")
+                freeze_start = time.time()
+                FREEZE_TIMEOUT = 2.0
+                while (time.time() - freeze_start) < FREEZE_TIMEOUT:
+                    if self.stop_event.is_set():
+                        return
+                    time.sleep(0.05)
+                    if not self._is_skill_grayed(skill_slot):
+                        self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s")
+                        break
+                else:
+                    self._log(f"[CE] Freeze timeout 2s → force-cast")
+
+            # Cast skill 3x (immediate if not grayed; otherwise after wait)
+            self._log(f"[CE] Skill 3x")
+            self.key_sender.send(skill_key)
+            time.sleep(0.07)
+            self.key_sender.send(skill_key)
+            time.sleep(0.07)
+            self.key_sender.send(skill_key)
+
+            # SELF popup retry — check IMMEDIATELY first (normal case popup is
+            # already gone after press 2 confirm). Only wait+retry if stuck.
             for attempt in range(8):
                 if self.stop_event.is_set():
                     return
