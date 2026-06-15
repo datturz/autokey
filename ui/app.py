@@ -1473,14 +1473,17 @@ class L2MAutoKeyApp:
         return is_grayed
 
     def _do_combat_escape(self, settings, hp_pct_int, threshold):
-        """Internal combat escape — simple reliable flow:
+        """Internal combat escape — flow agressive (urutan fixed):
 
-        1. Weapon switch
-        1.5. Wait while skill slot grayed (enemy freeze debuff, max 15s)
-        2. Skill 2x (activate: SELF popup + confirm)
-        3. Wait 1.5s (skill becomes active = stun immune)
-        4. Skill 2x (cancel)
-        5. TP spam (immediately after cancel, no gap)
+        0. SPAM TP DULU       (tp_key burst — sebelum ritual stun!) → cek list
+                              NPC/kota. Kebuka? escape sukses, skip step 1-5.
+        1. icon combat show   (trigger — dideteksi di _check_combat_icon_escape)
+        2. ganti weapon       (weapon_key)        ─┐
+        3. check gray or not  (slot skill grayed)  │ FALLBACK: cuma kalau Step0
+        4. cast skill         (skill_key 2x)        │ belum escape (masih lapangan)
+        5. wait               (1 detik, stun immune)─┘
+        6. cancel skill       (skill_key 2x) ─┐ interleaved (barengan), cuma
+        7. tp burst           (spam tp_key)  ─┘ kalau ritual jalan; no gap/hole
 
         If skill is on cooldown, presses do nothing (safe).
         """
@@ -1491,68 +1494,98 @@ class L2MAutoKeyApp:
         potion_key = settings.get("combat_escape_potion_key", "")
         skill_slot = settings.get("combat_escape_skill_slot", 4)
 
-        # Step 1: Weapon switch
-        if weapon_key:
-            self._log(f"[CE] Weapon: {weapon_key}")
-            self.key_sender.send(weapon_key)
-            time.sleep(0.1)  # game UI update is fast — minimal gap to skill cast
+        # Burst tuning (dipakai Step0 + loop TP). Definisi di atas biar sekali.
+        TP_TIMEOUT = 60.0
+        BURST_SIZE = 20
+        BURST_HOLD = 0.05  # tight hold — cancel & TP mulus tanpa dead-air per key
 
-        # Step 2: Quick check — if NOT grayed, cast immediately (no wait).
-        # Only wait if confirmed grayed (frozen by enemy).
-        if skill_key:
-            self._last_skill_grayed_state = None
-            self._skill_region_cache = None  # refresh region from settings each CE
+        def _in_town(image) -> bool:
+            """List NPC / panel kota terbuka = sudah/sedang masuk kota."""
+            return bool(image and (self._check_in_town_by_shop_icon(image)
+                                   or self._is_opening_shop(image)))
 
-            # Fresh capture — cached_img may be from BEFORE weapon switch (stale)
-            # which causes false-positive grayed for the new weapon's skill icon.
-            is_grayed = self._is_skill_grayed(skill_slot, img=None)
-
-            if is_grayed:
-                # Frozen → short wait loop (max 2s) before force-cast
-                self._log(f"[CE] Skill slot {skill_slot} grayed → freeze, menunggu (max 2s)...")
-                freeze_start = time.time()
-                FREEZE_TIMEOUT = 2.0
-                while (time.time() - freeze_start) < FREEZE_TIMEOUT:
-                    if self.stop_event.is_set():
-                        return
-                    time.sleep(0.05)
-                    if not self._is_skill_grayed(skill_slot):
-                        self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s")
-                        break
-                else:
-                    self._log(f"[CE] Freeze timeout 2s → force-cast")
-
-            # Cast skill 3x (immediate if not grayed; otherwise after wait)
-            self._log(f"[CE] Skill 3x")
-            self.key_sender.send(skill_key)
-            time.sleep(0.07)
-            self.key_sender.send(skill_key)
-            time.sleep(0.07)
-            self.key_sender.send(skill_key)
-
-            # SELF popup retry — check IMMEDIATELY first (normal case popup is
-            # already gone after press 2 confirm). Only wait+retry if stuck.
-            for attempt in range(8):
-                if self.stop_event.is_set():
+        # ── Step 0 (AGGRESSIVE): SPAM TP DULU sebelum ritual stun ──
+        # Begitu di-hit pertama kali & icon combat muncul, JANGAN nunggu ritual
+        # weapon→skill→wait dulu (buang ~1.3s sambil dipukul). Langsung tembak
+        # TP burst. Kalau karakter belum/tidak ke-stun, TP langsung jalan =
+        # escape tercepat. Lalu cek: kalau list NPC (panel kota) belum terbuka
+        # → berarti masih di lapangan (mungkin ke-stun / TP keblok) → lanjut
+        # ritual skill (stun immunity) sebagai fallback.
+        fast_escaped = False
+        if tp_key:
+            self._log("[CE] Step0 AGGRESSIVE: spam TP duluan (sebelum ritual stun)...")
+            self.key_sender.send_burst([tp_key] * BURST_SIZE, hold_time=BURST_HOLD)
+            time.sleep(0.25)
+            try:
+                img0 = self.capturer.capture() if self.capturer else None
+                if img0 and self.hunting_checker.is_dead(img0):
+                    self._log("[CE] MATI saat Step0! Klik Resurrect (640,525)...")
+                    if self.clicker:
+                        self.clicker.click_scaled(640, 525)
+                    self.is_in_town = False
+                    self._escaped_to_town_at = 0
+                    self._combat_escape_triggered = False
                     return
-                if not self._is_self_popup_open():
-                    if attempt > 0:
-                        self._log(f"[CE] SELF popup confirmed after {attempt} retry")
-                    break
-                self._log(f"[CE] SELF popup still open → retry {attempt+1}/8")
-                self.key_sender.send(skill_key)
-                self.key_sender.send(skill_key)
-                time.sleep(0.15)
-            else:
-                self._log(f"[CE] SELF popup stuck after 8 retries → continue anyway")
+                if _in_town(img0):
+                    fast_escaped = True
+                    self._log("[CE] Step0 SUKSES: list NPC/kota terbuka → skip ritual skill!")
+                else:
+                    self._log("[CE] Step0: list NPC belum terbuka → masih di lapangan, lanjut ritual...")
+            except Exception:
+                pass
 
-            # Step 3: WAIT for skill to fully activate (stun immunity)
-            time.sleep(1.5)
-        # Step 4+5: Cancel skill → Burst TP as ONE atomic sequence.
-        # ALL state + log are set BEFORE the key sequence so there is ZERO Python
-        # work (log/assign/capture) between cancel-keyup and the first TP-keydown
-        # — that gap was the "hole" where an enemy hit could cancel the teleport.
-        self._log(f"[CE] Cancel → Burst TP '{tp_key}' sampai di kota...")
+        # ── Step 1-5: weapon + ritual skill stun-immunity ──
+        # Hanya jalan kalau Step0 belum berhasil escape (masih di lapangan).
+        did_ritual = False
+        if not fast_escaped:
+            # Step 1: Weapon switch
+            if weapon_key:
+                self._log(f"[CE] Weapon: {weapon_key}")
+                self.key_sender.send(weapon_key)
+                time.sleep(0.1)  # game UI update is fast — minimal gap to skill cast
+
+            if skill_key:
+                did_ritual = True
+                self._last_skill_grayed_state = None
+                self._skill_region_cache = None  # refresh region from settings each CE
+
+                # ── Step 3: CHECK GRAY OR NOT ──
+                # Cek slot skill grayed (ke-freeze musuh) atau tidak. Fresh capture
+                # (cached img bisa dari SEBELUM weapon switch → stale → false-positive).
+                is_grayed = self._is_skill_grayed(skill_slot, img=None)
+                if is_grayed:
+                    # Grayed = freeze. Cek cepat max 0.5s (jangan nunggu lama, tiap
+                    # detik diam = damage), lalu force-cast.
+                    self._log(f"[CE] Step3 check gray: GRAYED (freeze) → cek cepat max 0.5s...")
+                    freeze_start = time.time()
+                    while (time.time() - freeze_start) < 0.5:
+                        if self.stop_event.is_set():
+                            return
+                        time.sleep(0.05)
+                        if not self._is_skill_grayed(skill_slot):
+                            self._log(f"[CE] Freeze cleared after {time.time()-freeze_start:.1f}s")
+                            break
+                    else:
+                        self._log(f"[CE] Freeze masih → force-cast")
+                else:
+                    self._log(f"[CE] Step3 check gray: NOT grayed → cast langsung")
+
+                # ── Step 4: CAST SKILL ──
+                # Self-target skill: press 1 buka SELF target, press 2 confirm cast.
+                self._log(f"[CE] Step4 cast skill: {skill_key} 2x")
+                self.key_sender.send(skill_key)
+                self.key_sender.send(skill_key)
+
+                # ── Step 5: WAIT ──
+                # Tunggu 1 detik biar skill aktif (stun immunity) sebelum cancel.
+                self._log(f"[CE] Step5 wait 1s (skill aktivasi)...")
+                time.sleep(1.0)
+        # ── Step 6+7: CANCEL SKILL (2x) + TP BURST ──
+        # Cancel skill (2x press skill_key) DIBARENGI spam teleport — bukan cancel-
+        # dulu-baru-TP. Cancel di-INTERLEAVE ke awal TP burst: begitu skill animation
+        # ter-cancel (karakter bebas), TP instan langsung nembak detik itu juga.
+        # ALL state + log diset SEBELUM sekuens key = zero work di tengah = no hole.
+        self._log(f"[CE] Step6+7 cancel(2x)+burst TP '{tp_key}' sampai di kota...")
         self._escaped_to_town_at = time.time()
         self.is_in_town = True
         self.last_in_town_time = time.time()
@@ -1560,14 +1593,18 @@ class L2MAutoKeyApp:
 
         arrived = False
         tp_start = time.time()
-        TP_TIMEOUT = 60.0
-        BURST_SIZE = 20
-        BURST_HOLD = 0.05  # tight hold — cancel→TP mulus tanpa dead-air per key
         burst_round = 0
 
-        # First burst: cancel 2x (if skill set) IMMEDIATELY chained to TP burst —
-        # single send_burst call, no prints/sleeps in between = no hole.
-        first_seq = ([skill_key, skill_key] if skill_key else []) + [tp_key] * BURST_SIZE
+        # First burst: cancel (skill_key) INTERLEAVED dgn TP — HANYA kalau ritual
+        # skill tadi jalan (did_ritual). Pola [skill, tp, skill, tp, tp, ...]:
+        # cancel press 1 → TP, cancel press 2 → TP, lalu lanjut spam TP. Pastikan
+        # cancel kejadian (2 press) sambil TP terus nembak. Kalau Step0 sudah
+        # escape (fast_escaped, no skill cast) → first_seq cuma TP, nggak ada
+        # cancel (nggak ada skill aktif buat di-cancel).
+        if did_ritual and skill_key:
+            first_seq = [skill_key, tp_key, skill_key] + [tp_key] * BURST_SIZE
+        else:
+            first_seq = [tp_key] * BURST_SIZE
         self.key_sender.send_burst(first_seq, hold_time=BURST_HOLD)
         burst_round += 1
 
